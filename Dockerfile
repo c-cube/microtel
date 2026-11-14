@@ -17,3 +17,5 @@ EXPOSE 4318
 VOLUME /data
 ENTRYPOINT ["microtel"]
 CMD ["--listen", "0.0.0.0:4318", "--storage-dir", "/data"]
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["microtel", "healthcheck"]
