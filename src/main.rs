@@ -1,8 +1,11 @@
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use clap::Parser;
-use microtel::{config, ingest, pipeline, purge, store};
+use clap::{Parser, Subcommand};
+use microtel::{config, ingest, pipeline, purge, stats, store};
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -21,36 +24,61 @@ struct Cli {
     /// Override retention TTL in days
     #[arg(long)]
     ttl_days: Option<u32>,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Exit 0 iff a running microtel's /health endpoint answers HTTP 200.
+    Healthcheck {
+        /// host:port to probe
+        #[arg(long, default_value = "127.0.0.1:4318")]
+        addr: String,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    if let Some(Cmd::Healthcheck { addr }) = cli.cmd {
+        std::process::exit(healthcheck(&addr));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let cli = Cli::parse();
     let cfg = config::load(cli.config, cli.listen, cli.storage_dir, cli.ttl_days)?;
     tokio::runtime::Runtime::new()?.block_on(tokio_run(cfg))
 }
 
 async fn tokio_run(cfg: config::Config) -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(store::Store::open(&cfg.storage_dir)?);
-    let (traces, trace_rx, trace_queued) = pipeline::Pipeline::channel(cfg.queue.capacity);
-    let (metrics, metric_rx, metric_queued) = pipeline::Pipeline::channel(cfg.queue.capacity);
-    let app = Arc::new(ingest::App { traces, metrics });
+    let stats = Arc::new(stats::Stats::new());
+    let (traces, trace_rx) =
+        pipeline::Pipeline::channel(cfg.queue.capacity, stats.gauge(stats::Signal::Traces));
+    let (metrics, metric_rx) =
+        pipeline::Pipeline::channel(cfg.queue.capacity, stats.gauge(stats::Signal::Metrics));
+    let app = Arc::new(ingest::App {
+        traces,
+        metrics,
+        stats: stats.clone(),
+        store: store.clone(),
+    });
     let trace_writer = tokio::spawn(pipeline::writer(
         trace_rx,
         store.clone(),
         cfg.queue.clone(),
-        trace_queued,
+        stats.gauge(stats::Signal::Traces),
+        stats.clone(),
     ));
     let metric_writer = tokio::spawn(pipeline::writer(
         metric_rx,
         store.clone(),
         cfg.queue,
-        metric_queued,
+        stats.gauge(stats::Signal::Metrics),
+        stats.clone(),
     ));
     let purge_handle = tokio::spawn(purge::purge_task(
         store.clone(),
@@ -87,4 +115,33 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+}
+
+fn healthcheck(addr: &str) -> i32 {
+    let timeout = Duration::from_secs(2);
+    let Ok(mut stream) = TcpStream::connect(addr) else {
+        eprintln!("healthcheck: connect {addr} failed");
+        return 1;
+    };
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        eprintln!("healthcheck: socket setup failed");
+        return 1;
+    }
+    let req = format!("GET /health HTTP/1.0\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        eprintln!("healthcheck: write failed");
+        return 1;
+    }
+    let mut buf = Vec::new();
+    if stream.read_to_end(&mut buf).is_err() {
+        eprintln!("healthcheck: read failed");
+        return 1;
+    }
+    let ok = buf.starts_with(b"HTTP/") && buf.windows(5).any(|w| w == b" 200 ");
+    if !ok {
+        eprintln!("healthcheck: no HTTP 200 from {addr}");
+    }
+    i32::from(!ok)
 }

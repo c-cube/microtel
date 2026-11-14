@@ -138,6 +138,27 @@ impl Store {
             .count())
     }
 
+    /// `rocksdb.estimate-num-keys` per data CF, surfaced on `/stats`.
+    pub fn estimate_rows(&self) -> Vec<(&'static str, u64)> {
+        [
+            CF_SPAN_TRACE,
+            CF_SPAN_TIME,
+            CF_RESOURCES,
+            CF_SCOPES,
+            CF_SERIES,
+            CF_POINTS,
+        ]
+        .iter()
+        .filter_map(|cf| {
+            self.db
+                .property_int_value_cf(self.cf(cf), "rocksdb.estimate-num-keys")
+                .ok()
+                .flatten()
+                .map(|rows| (*cf, rows))
+        })
+        .collect()
+    }
+
     pub fn get(&self, cf: &str, key: &[u8]) -> DbResult<Option<Vec<u8>>> {
         self.db.get_cf(self.cf(cf), key)
     }

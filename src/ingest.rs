@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, post};
+use axum::routing::{any, get, post};
 use prost::Message;
 use tokio::sync::mpsc;
 
@@ -17,11 +17,14 @@ use crate::proto::{
     AttrSet, Data, ExportMetricsServiceRequest, ExportTraceServiceRequest, NumberDataPoint,
     SpanEnvelope, hash16,
 };
-use crate::store::{MetricBatch, PointRow, SeriesRow, SpanBatch, SpanRow};
+use crate::stats::{Endpoint, Stats};
+use crate::store::{MetricBatch, PointRow, SeriesRow, SpanBatch, SpanRow, Store};
 
 pub struct App {
     pub traces: Pipeline<SpanBatch>,
     pub metrics: Pipeline<MetricBatch>,
+    pub stats: Arc<Stats>,
+    pub store: Arc<Store>,
 }
 
 pub fn router(app: Arc<App>) -> Router {
@@ -29,15 +32,23 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/traces", post(traces))
         .route("/v1/metrics", post(metrics))
         .route("/v1/logs", any(logs))
+        .route("/health", get(health))
+        .route("/stats", get(stats))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(app)
 }
 
 async fn traces(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Some(resp) = check_content_type(&headers) {
+    let resp = traces_inner(&app, &headers, body).await;
+    app.stats.request(Endpoint::Traces, resp.status().as_u16());
+    resp
+}
+
+async fn traces_inner(app: &App, headers: &HeaderMap, body: Bytes) -> Response {
+    if let Some(resp) = check_content_type(headers) {
         return resp;
     }
-    let raw = match decompress(&headers, &body) {
+    let raw = match decompress(headers, &body) {
         Ok(raw) => raw,
         Err(_) => return bad_request("invalid gzip body"),
     };
@@ -52,6 +63,8 @@ async fn traces(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) ->
     };
     let mut res_rows: HashMap<[u8; keys::HASH_LEN], Vec<u8>> = HashMap::new();
     let mut scope_rows: HashMap<[u8; keys::HASH_LEN], Vec<u8>> = HashMap::new();
+    let mut seen = 0u64;
+    let mut invalid = 0u64;
     for rs in req.resource_spans {
         let resource = rs.resource.unwrap_or_default();
         let rh = hash16(&resource);
@@ -65,6 +78,7 @@ async fn traces(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) ->
                 .entry(sh)
                 .or_insert_with(|| scope.encode_to_vec());
             for span in ss.spans {
+                seen += 1;
                 // OTLP: ids of any other length or all zeroes are invalid
                 let zero = |b: &Vec<u8>| b.iter().all(|&x| x == 0);
                 if span.trace_id.len() != keys::TRACE_ID_LEN
@@ -73,6 +87,7 @@ async fn traces(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) ->
                     || zero(&span.span_id)
                 {
                     tracing::warn!("dropping span with invalid ids");
+                    invalid += 1;
                     continue;
                 }
                 let trace_id = span.trace_id.clone();
@@ -97,14 +112,32 @@ async fn traces(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) ->
     }
     batch.resources = res_rows.into_iter().collect();
     batch.scopes = scope_rows.into_iter().collect();
-    send(&app.traces, batch)
+    match app.traces.send(batch) {
+        Ok(()) => {
+            app.stats.spans_received(seen);
+            app.stats.spans_dropped(invalid);
+            ok_protobuf()
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            (StatusCode::TOO_MANY_REQUESTS, "queue full").into_response()
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response()
+        }
+    }
 }
 
 async fn metrics(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Some(resp) = check_content_type(&headers) {
+    let resp = metrics_inner(&app, &headers, body).await;
+    app.stats.request(Endpoint::Metrics, resp.status().as_u16());
+    resp
+}
+
+async fn metrics_inner(app: &App, headers: &HeaderMap, body: Bytes) -> Response {
+    if let Some(resp) = check_content_type(headers) {
         return resp;
     }
-    let raw = match decompress(&headers, &body) {
+    let raw = match decompress(headers, &body) {
         Ok(raw) => raw,
         Err(_) => return bad_request("invalid gzip body"),
     };
@@ -117,6 +150,7 @@ async fn metrics(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -
         points: Vec::new(),
     };
     let mut series_rows: HashMap<(String, [u8; keys::HASH_LEN]), SeriesRow> = HashMap::new();
+    let mut seen = 0u64;
     for rm in req.resource_metrics {
         for sm in rm.scope_metrics {
             for m in sm.metrics {
@@ -129,6 +163,7 @@ async fn metrics(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -
                         continue;
                     }
                 };
+                seen += dps.len() as u64;
                 for dp in dps {
                     let value = dp.encode_to_vec();
                     let attr_set = AttrSet {
@@ -155,16 +190,11 @@ async fn metrics(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -
         }
     }
     batch.series = series_rows.into_values().collect();
-    send(&app.metrics, batch)
-}
-
-async fn logs() -> Response {
-    (StatusCode::NOT_IMPLEMENTED, "logs signal not supported").into_response()
-}
-
-fn send<T>(pipeline: &Pipeline<T>, batch: T) -> Response {
-    match pipeline.send(batch) {
-        Ok(()) => ok_protobuf(),
+    match app.metrics.send(batch) {
+        Ok(()) => {
+            app.stats.points_received(seen);
+            ok_protobuf()
+        }
         Err(mpsc::error::TrySendError::Full(_)) => {
             (StatusCode::TOO_MANY_REQUESTS, "queue full").into_response()
         }
@@ -172,6 +202,20 @@ fn send<T>(pipeline: &Pipeline<T>, batch: T) -> Response {
             (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response()
         }
     }
+}
+
+async fn logs(State(app): State<Arc<App>>) -> Response {
+    let resp = (StatusCode::NOT_IMPLEMENTED, "logs signal not supported").into_response();
+    app.stats.request(Endpoint::Logs, resp.status().as_u16());
+    resp
+}
+
+async fn health() -> &'static str {
+    "ok"
+}
+
+async fn stats(State(app): State<Arc<App>>) -> String {
+    app.stats.render(&app.store)
 }
 
 /// 415 on an explicitly wrong content type; absent header defers to body parsing.

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use microtel::config::Queue;
 use microtel::pipeline::{self, Pipeline};
+use microtel::stats::{Signal, Stats};
 use microtel::store::SpanBatch;
 use microtel::store::Store;
 use tokio::sync::mpsc;
@@ -39,7 +40,8 @@ async fn watermark_triggers_a_flush_before_the_interval() {
     let dir = tmp_dir("watermark");
     let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
     // interval is far too long to be what flushed
-    let (pipeline, rx, queued) = Pipeline::<SpanBatch>::channel(10);
+    let stats = Arc::new(Stats::new());
+    let (pipeline, rx) = Pipeline::<SpanBatch>::channel(10, stats.gauge(Signal::Traces));
     let handle = tokio::spawn(pipeline::writer(
         rx,
         store.clone(),
@@ -48,7 +50,8 @@ async fn watermark_triggers_a_flush_before_the_interval() {
             watermark: 5,
             flush_ms: 30_000,
         },
-        queued,
+        stats.gauge(Signal::Traces),
+        stats,
     ));
     for i in 0..5u8 {
         pipeline.send(span_batch(i)).unwrap();
@@ -61,7 +64,8 @@ async fn watermark_triggers_a_flush_before_the_interval() {
 async fn interval_triggers_a_flush_without_reaching_the_watermark() {
     let dir = tmp_dir("interval");
     let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
-    let (pipeline, rx, queued) = Pipeline::<SpanBatch>::channel(10);
+    let stats = Arc::new(Stats::new());
+    let (pipeline, rx) = Pipeline::<SpanBatch>::channel(10, stats.gauge(Signal::Traces));
     let handle = tokio::spawn(pipeline::writer(
         rx,
         store.clone(),
@@ -70,7 +74,8 @@ async fn interval_triggers_a_flush_without_reaching_the_watermark() {
             watermark: 100,
             flush_ms: 150,
         },
-        queued,
+        stats.gauge(Signal::Traces),
+        stats,
     ));
     pipeline.send(span_batch(0)).unwrap();
     eventually(&store, "spans_by_trace", 1).await;
@@ -81,7 +86,8 @@ async fn interval_triggers_a_flush_without_reaching_the_watermark() {
 async fn closing_the_channel_drains_everything() {
     let dir = tmp_dir("drain");
     let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
-    let (pipeline, rx, queued) = Pipeline::<SpanBatch>::channel(10);
+    let stats = Arc::new(Stats::new());
+    let (pipeline, rx) = Pipeline::<SpanBatch>::channel(10, stats.gauge(Signal::Traces));
     let handle = tokio::spawn(pipeline::writer(
         rx,
         store.clone(),
@@ -90,7 +96,8 @@ async fn closing_the_channel_drains_everything() {
             watermark: 100,
             flush_ms: 60_000,
         },
-        queued,
+        stats.gauge(Signal::Traces),
+        stats,
     ));
     for i in 0..3u8 {
         pipeline.send(span_batch(i)).unwrap();
@@ -109,7 +116,8 @@ async fn full_queue_rejects_with_full_error() {
     let dir = tmp_dir("full");
     let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
     // capacity 2, no writer running: nothing drains the queue
-    let (pipeline, _rx, _queued) = Pipeline::<SpanBatch>::channel(2);
+    let (pipeline, _rx) =
+        Pipeline::<SpanBatch>::channel(2, Arc::new(Stats::new()).gauge(Signal::Traces));
     pipeline.send(span_batch(0)).expect("first send fits");
     pipeline.send(span_batch(1)).expect("second send fits");
     let attempt = pipeline.send(span_batch(2));
