@@ -1,0 +1,15 @@
+
+# Added by cargo
+
+/target
+
+# microtel
+/data
+node_modules
+
+# microtel dev artifacts
+.tmp
+.smoke
+.test.log
+.emit.log
+microtel.yaml

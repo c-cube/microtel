@@ -1,0 +1,8 @@
+storage_dir: ./data
+listen: 127.0.0.1:4318
+ttl_days: 30
+purge_interval_secs: 86400
+queue:        # per signal: traces and metrics each get their own queue
+  capacity: 1000
+  watermark: 500
+  flush_ms: 1000
