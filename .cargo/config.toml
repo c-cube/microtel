@@ -1,0 +1,8 @@
+# librocksdb-sys reads these while it is built, so they must be set before cargo
+# starts: build.rs cannot influence its vendored-vs-system choice.
+[env]
+ROCKSDB_LIB_DIR = "/usr/lib/x86_64-linux-gnu"
+ROCKSDB_INCLUDE_DIR = "/usr/include"
+ROCKSDB_STATIC = "1"
+SNAPPY_LIB_DIR = "/usr/lib/x86_64-linux-gnu"
+SNAPPY_STATIC = "1"
