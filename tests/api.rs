@@ -505,8 +505,14 @@ fn api_serves_charts_and_validates_params() {
     );
     assert_eq!(status_of(format!("http://{addr}/api/nope")), 404);
 
-    // ui/dist has no index.html yet: the SPA fallback says so, distinctly.
-    assert_eq!(status_of(format!("http://{addr}/")), 503);
+    // the SPA fallback answers every client route with the embedded index
+    let root = ureq::get(&format!("http://{addr}/")).call().unwrap();
+    assert_eq!(root.status(), 200);
+    assert!(
+        root.header("content-type")
+            .unwrap_or("")
+            .starts_with("text/html")
+    );
 
     common::terminate(&mut child);
 }
