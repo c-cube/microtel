@@ -50,8 +50,12 @@ function stackedBars(): uPlot.Plugin {
         if (!n) return;
         const px = (i: number) => u.valToPos(u.data[0][i], "x", true);
         const slot = n > 1 ? Math.abs(px(1) - px(0)) : u.bbox.width;
-        const w = Math.max(1, Math.min(28, slot * 0.8));
+        const w = Math.max(1, Math.min(48, slot * 0.8));
 
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
+        ctx.clip();
         const hovered = u.cursor.idx;
         if (hovered != null && hovered < n) {
           ctx.fillStyle = "rgba(128,140,160,0.18)";
@@ -77,6 +81,7 @@ function stackedBars(): uPlot.Plugin {
             below += v;
           }
         }
+        ctx.restore();
       },
     },
   };

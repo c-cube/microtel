@@ -22,15 +22,27 @@ const OTHER: &str = "other";
 
 /// Millisecond steps considered for bucket sizing; smallest with <=300 buckets wins.
 const STEPS_MS: &[u64] = &[
-    1_000, 2_000, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000,
-    1_800_000, 3_600_000, 7_200_000, 10_800_000, 21_600_000, 43_200_000, 86_400_000,
+    1_000, 2_000, 3_000, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000, 180_000, 300_000, 600_000,
+    900_000, 1_800_000, 3_600_000, 7_200_000, 10_800_000, 21_600_000, 43_200_000, 86_400_000,
 ];
 
+/// Upper bound on buckets per chart: keeps the payload and the bar width sane.
+pub const MAX_BUCKETS: usize = 300;
+const MIN_BUCKETS: usize = 8;
+
 pub fn pick_bucket_ms(range_ms: u64) -> u64 {
+    pick_bucket_ms_for(range_ms, None)
+}
+
+/// Snap to the finest step whose bucket count does not exceed `want`, so a
+/// client sizing `want` from its width gets bars at least that wide. When even
+/// the coarsest step overshoots, the coarsest wins. Never exceeds MAX_BUCKETS.
+pub fn pick_bucket_ms_for(range_ms: u64, want: Option<usize>) -> u64 {
+    let want = want.unwrap_or(MAX_BUCKETS).clamp(MIN_BUCKETS, MAX_BUCKETS) as u64;
     STEPS_MS
         .iter()
-        .find(|step| range_ms / **step <= 300)
         .copied()
+        .find(|&step| range_ms.div_ceil(step).max(1) <= want)
         .unwrap_or(*STEPS_MS.last().expect("non-empty"))
 }
 
@@ -117,6 +129,9 @@ pub struct TraceSpan {
     pub parent_span_id: Option<String>,
     pub name: String,
     pub service: String,
+    pub kind: i32,
+    pub error: bool,
+    pub status_message: String,
     pub start_ns: u64,
     pub end_ns: u64,
     pub duration_ns: u64,
@@ -181,6 +196,13 @@ pub fn trace(store: &Store, trace_id_hex: &str, at_ms: u64) -> Result<Vec<TraceS
                     .then(|| hex(&span.parent_span_id)),
                 name: span.name,
                 service,
+                kind: span.kind,
+                error: span.status.as_ref().is_some_and(|s| s.code == 2),
+                status_message: span
+                    .status
+                    .as_ref()
+                    .map(|s| s.message.clone())
+                    .unwrap_or_default(),
                 start_ns: span.start_time_unix_nano,
                 end_ns: span.end_time_unix_nano,
                 duration_ns: span
@@ -253,10 +275,11 @@ pub fn barchart(
     by: GroupBy,
     svcs: &[String],
     cap: usize,
+    buckets: Option<usize>,
 ) -> Barchart {
     let from_ns = from_ms * 1_000_000;
     let to_ns = to_ms * 1_000_000;
-    let bucket_ms = pick_bucket_ms(to_ms - from_ms);
+    let bucket_ms = pick_bucket_ms_for(to_ms - from_ms, buckets);
     let bucket_ns = bucket_ms * 1_000_000;
     let n = usize::try_from((to_ns - from_ns).div_ceil(bucket_ns)).unwrap_or(1);
     let first_ymd = keys::ymd(from_ns);
@@ -454,10 +477,11 @@ pub fn points(
     to_ms: u64,
     svcs: &[String],
     cap: usize,
+    buckets: Option<usize>,
 ) -> Points {
     let from_ns = from_ms * 1_000_000;
     let to_ns = to_ms * 1_000_000;
-    let bucket_ms = pick_bucket_ms(to_ms - from_ms);
+    let bucket_ms = pick_bucket_ms_for(to_ms - from_ms, buckets);
     let bucket_ns = bucket_ms * 1_000_000;
     let n = usize::try_from((to_ns - from_ns).div_ceil(bucket_ns)).unwrap_or(1);
     let first_ymd = keys::ymd(from_ns);

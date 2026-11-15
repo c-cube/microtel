@@ -16,6 +16,29 @@ export default function Spans() {
   const svcs = () => svcsList(params.svcs);
   const rf = () => Number(params.rf ?? 60_000);
 
+  // each bar slot gets at least MIN_SLOT_PX so it stays comfortably clickable;
+  // the server snaps to the finest step that fits this many buckets
+  const MIN_SLOT_PX = 22;
+  const [want, setWant] = createSignal(60);
+  let cardEl: HTMLElement | undefined;
+  onMount(() => {
+    let timer = 0;
+    const measure = () => {
+      const w = (cardEl?.clientWidth ?? 0) - 90;
+      if (w > 0) setWant(Math.max(8, Math.floor(w / MIN_SLOT_PX)));
+    };
+    measure();
+    const ro = new ResizeObserver(() => {
+      clearTimeout(timer);
+      timer = window.setTimeout(measure, 200);
+    });
+    if (cardEl) ro.observe(cardEl);
+    onCleanup(() => {
+      clearTimeout(timer);
+      ro.disconnect();
+    });
+  });
+
   onMount(() => {
     if (!params.from || !params.to) {
       setParams({ from: fromMs(), to: toMs(), rf: rf() }, { replace: true });
@@ -27,6 +50,7 @@ export default function Spans() {
       from: String(fromMs()),
       to: String(toMs()),
       group_by: group(),
+      buckets: String(want()),
     });
     const s = svcs();
     if (s.length) q.set("svcs", s.join(","));
@@ -165,7 +189,7 @@ export default function Spans() {
         </Show>
       </div>
 
-      <section class="card">
+      <section class="card" ref={cardEl}>
         <div class="card-head">
           <span class="card-title">Spans over time</span>
           <span class="card-sub">
