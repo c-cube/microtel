@@ -30,8 +30,11 @@ protocol edges, SIGKILL crash recovery, backpressure). The emitter tests need no
 ## UI
 
 SolidJS + uPlot, embedded into the binary from `ui/dist` (include_dir).
-Charts: stacked span histogram with group-by and exemplar trace ids, metric
-lines on a shared bucket grid. `from`/`to`/`svcs`/`refresh` live in the URL.
+Chart pages: stacked span histogram with group-by, service filters and exemplar
+trace links; metric lines on a shared bucket grid. Clicking a bar copies the
+exemplar trace id and offers a link into the waterfall. `/trace/<id>?at=<ms>`
+shows the flat trace as a waterfall with per-span attributes. `from`/`to`/
+`svcs`/`refresh`/`group`/`metric` live in the URL.
 
     pnpm --dir ui install        # once
     pnpm --dir ui build          # required before cargo build (placeholder 503 otherwise)
@@ -39,6 +42,39 @@ lines on a shared bucket grid. `from`/`to`/`svcs`/`refresh` live in the URL.
 
 cargo picks up `ui/dist` changes via rerun-if-changed entries from build.rs.
 The docker build compiles the UI in a node stage first.
+
+### demo data and screenshots
+
+`tools/seed.mjs` POSTs a realistic dataset (checkout + browse flows across
+eight services, nested spans, errors, slow outliers, six hours of metrics)
+using a dependency-free OTLP protobuf encoder in `tools/lib/otlp.mjs`:
+
+    EMIT_ENDPOINT=http://127.0.0.1:4318 node tools/seed.mjs
+    EMIT_HOURS=24 EMIT_TRACES=5000 EMIT_ENDPOINT=... node tools/seed.mjs
+
+`tools/shot.mjs` screenshots a page with headless chromium (needs
+`pnpm --dir tools exec playwright install chromium`; on distros newer than the
+playwright release, add `PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64`):
+
+    node tools/shot.mjs http://127.0.0.1:4318/spans shot.png --width=1440 --height=900
+
+### fuzzing the UI with bombadil
+
+[Bombadil](https://antithesishq.github.io/bombadil/) explores the UI with
+random clicks, typing and navigation and checks properties over every state.
+`tools/bombadil/spec.ts` keeps the defaults (uncaught exceptions, error logs,
+4xx/5xx) and adds layout invariants: well-formed trace urls, a non-empty main
+area, the chart canvas fitting its card, sane waterfall durations, a settled
+metric selection and exemplar links pointing at real traces.
+
+`tools/ui-check.sh` starts a throwaway server on :19418, seeds it, and runs
+bombadil for N seconds each on `/spans`, `/metrics` and a real trace:
+
+    # grab the bombadil binary from its releases page, then:
+    tools/ui-check.sh 60
+
+Set `BOMBADIL=` and `CHROME=` when they are not on `PATH` / in a standard
+location.
 
 ## Docker
 
