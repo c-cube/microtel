@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createResource, createSignal } from "solid-js";
 import { A, useParams, useSearchParams } from "@solidjs/router";
-import { PALETTE } from "../plot";
+import { palette } from "../plot";
 import { fmtDur, fmtWhen, trace, type TraceSpan } from "../api";
 
 const KIND = ["internal", "internal", "server", "client", "producer", "consumer"];
@@ -8,6 +8,7 @@ const KIND = ["internal", "internal", "server", "client", "producer", "consumer"
 interface Row {
   span: TraceSpan;
   depth: number;
+  kids: number; // direct children
 }
 
 // 0, step, 2*step... on round time units so the ruler reads naturally
@@ -42,7 +43,9 @@ function RowView(props: {
   spanNs: number;
   color: string;
   open: boolean;
+  folded: boolean;
   onToggle: () => void;
+  onFold: () => void;
 }) {
   const s = () => props.row.span;
   const left = () => ((s().start_ns - props.t0) / props.spanNs) * 100;
@@ -53,14 +56,33 @@ function RowView(props: {
     <>
       <div
         class={`wf-row ${s().error ? "err" : ""}`}
-        style={{ cursor: "pointer" }}
+        tabindex="0"
         onClick={props.onToggle}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            props.onToggle();
+          }
+        }}
         title={s().error && s().status_message ? s().status_message : s().span_id}
       >
-        <div class="wf-name" style={{ "padding-left": `${props.row.depth * 14}px` }}>
-          <span class="dot" style={{ background: props.color }} />
+        <div class="wf-name" style={{ "padding-left": `${props.row.depth * 16}px` }}>
+          <button
+            class={`wf-fold ${props.row.kids ? "" : "leaf"}`}
+            title={props.folded ? "expand children" : "collapse children"}
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onFold();
+            }}
+          >
+            {props.row.kids ? (props.folded ? "▸" : "▾") : ""}
+          </button>
+          <span class="sw" style={{ background: props.color }} />
           <span class="wf-kind">{KIND[s().kind] ?? "internal"}</span>
           <span class="txt">{s().name}</span>
+          <Show when={props.folded}>
+            <span class="wf-hidden">+{props.row.kids}</span>
+          </Show>
           <span class="svc">{s().service}</span>
         </div>
         <div class="wf-track">
@@ -134,11 +156,12 @@ export default function Trace() {
     const walk = (s: TraceSpan, depth: number) => {
       if (seen.has(s.span_id)) return;
       seen.add(s.span_id);
-      out.push({ span: s, depth });
-      for (const c of (kids.get(s.span_id) ?? []).sort(byStart)) walk(c, depth + 1);
+      const ch = (kids.get(s.span_id) ?? []).sort(byStart);
+      out.push({ span: s, depth, kids: ch.length });
+      for (const c of ch) walk(c, depth + 1);
     };
     roots.sort(byStart).forEach((s) => walk(s, 0));
-    for (const s of [...spans].sort(byStart)) if (!seen.has(s.span_id)) out.push({ span: s, depth: 0 });
+    for (const s of [...spans].sort(byStart)) if (!seen.has(s.span_id)) out.push({ span: s, depth: 0, kids: 0 });
     return out;
   });
 
@@ -147,7 +170,8 @@ export default function Trace() {
   const spanNs = () => Math.max(t1() - t0(), 1);
 
   const services = createMemo(() => [...new Set((data() ?? []).map((s) => s.service))].sort());
-  const colorOf = (svc: string) => PALETTE[Math.max(0, services().indexOf(svc)) % PALETTE.length];
+  const colorOf = (svc: string) => palette()[Math.max(0, services().indexOf(svc)) % palette().length];
+  const perSvc = (svc: string) => (data() ?? []).filter((s) => s.service === svc).length;
 
   const errors = () => (data() ?? []).filter((s) => s.error).length;
 
@@ -159,6 +183,29 @@ export default function Trace() {
       else next.add(id);
       return next;
     });
+
+  const [folded, setFolded] = createSignal<Set<string>>(new Set());
+  const fold = (id: string) =>
+    setFolded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const visible = createMemo(() => {
+    const f = folded();
+    const out: Row[] = [];
+    let hideBelow = -1;
+    for (const r of rows()) {
+      if (hideBelow >= 0 && r.depth > hideBelow) continue;
+      hideBelow = -1;
+      out.push(r);
+      if (f.has(r.span.span_id)) hideBelow = r.depth;
+    }
+    return out;
+  });
+  const foldAll = (on: boolean) =>
+    setFolded(on ? new Set<string>(rows().filter((r) => r.kids).map((r) => r.span.span_id)) : new Set<string>());
 
   const [copied, setCopied] = createSignal(false);
   const copyId = () => {
@@ -217,16 +264,23 @@ export default function Trace() {
             <Show when={data()}>
               {(spans) => (
                 <>
-                  <div class="chips">
+                  <div class="tmeta">
                     <span class="card-sub">{fmtWhen(t0() / 1_000_000)}</span>
-                    <For each={services()}>
-                      {(svc) => (
-                        <span class="chip" style={{ color: colorOf(svc), cursor: "default" }}>
-                          <span class="dot" />
-                          {svc}
-                        </span>
-                      )}
-                    </For>
+                    <div class="legend inline">
+                      <For each={services()}>
+                        {(svc) => (
+                          <span class="lrow static">
+                            <span class="sw" style={{ background: colorOf(svc) }} />
+                            <span class="nm">{svc}</span>
+                            <span class="v">{perSvc(svc)}</span>
+                          </span>
+                        )}
+                      </For>
+                    </div>
+                    <div class="seg">
+                      <button onClick={() => foldAll(true)}>fold all</button>
+                      <button onClick={() => foldAll(false)}>unfold</button>
+                    </div>
                   </div>
 
                   <div class="wf">
@@ -235,7 +289,7 @@ export default function Trace() {
                       {ruler(ticks(), spanNs())}
                       <span style={{ "text-align": "right" }}>duration</span>
                     </div>
-                    <For each={rows()}>
+                    <For each={visible()}>
                       {(row) => (
                         <RowView
                           row={row}
@@ -243,7 +297,9 @@ export default function Trace() {
                           spanNs={spanNs()}
                           color={colorOf(row.span.service)}
                           open={open().has(row.span.span_id)}
+                          folded={folded().has(row.span.span_id)}
                           onToggle={() => toggle(row.span.span_id)}
+                          onFold={() => fold(row.span.span_id)}
                         />
                       )}
                     </For>

@@ -307,61 +307,94 @@ button, input, select { font-family: inherit; font-weight: inherit; }
 
 /* --- waterfall --- */
 
-.wf { padding: 4px 0 10px; }
+.tmeta {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  flex-wrap: wrap;
+}
+.tmeta .seg { margin-left: auto; }
+.legend.inline { display: flex; flex-wrap: wrap; gap: 2px 14px; border: 0; padding: 0; }
+.lrow.static { cursor: default; display: inline-flex; gap: 6px; align-items: center; border: 0; padding: 0; }
+.lrow.static .v { color: var(--muted); }
+
+.wf { padding: 0 0 4px; --name-w: minmax(260px, 36%); }
 
 .wf-head, .wf-row {
   display: grid;
-  grid-template-columns: minmax(240px, 34%) 1fr 86px;
-  gap: 12px;
+  grid-template-columns: var(--name-w) 1fr 78px;
+  gap: 10px;
   align-items: center;
-  padding: 0 14px;
+  padding: 0 10px;
 }
 
-.wf-head { color: var(--muted); font-size: 11px; padding-bottom: 6px; }
-.wf-ruler { position: relative; height: 14px; border-bottom: 1px solid var(--line); }
-.wf-tick { position: absolute; top: 0; font-size: 10.5px; transform: translateX(-50%); }
-.wf-tick::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: -5px;
-  height: 4px;
-  border-left: 1px solid var(--line);
+.wf-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
 }
+.wf-ruler { position: relative; height: 14px; }
+.wf-tick { position: absolute; top: 0; font-size: 10.5px; transform: translateX(-50%); }
 
 .wf-row {
-  padding-top: 3px;
-  padding-bottom: 3px;
-  border-radius: 6px;
+  min-height: 26px;
+  border-bottom: 1px solid var(--line-soft);
   cursor: pointer;
+  outline: none;
 }
-
-.wf-row:hover { background: var(--line-soft); }
+.wf-row:hover, .wf-row:focus-visible { background: var(--hover); }
+.wf-row:focus-visible { box-shadow: inset 2px 0 0 var(--brand); }
 .wf-row.err { background: var(--danger-soft); }
 
 .wf-name {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
   min-width: 0;
   font-size: 12.5px;
 }
-
 .wf-name .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wf-name .svc { color: var(--muted); font-size: 11.5px; flex: none; }
+.wf-name .svc { color: var(--muted); font-size: 11px; flex: none; margin-left: auto; }
+.wf-hidden { flex: none; color: var(--brand); font-size: 11px; }
+.wf-fold {
+  flex: none;
+  width: 16px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.wf-fold:hover { color: var(--brand); }
+.wf-fold.leaf { cursor: default; pointer-events: none; }
 .wf-kind {
   flex: none;
   font-size: 9.5px;
-  letter-spacing: 0.03em;
   color: var(--muted);
   border: 1px solid var(--line);
-  border-radius: 3px;
+  border-radius: 2px;
   padding: 0 3px;
   line-height: 1.4;
 }
 
-.wf-track { position: relative; height: 16px; background: var(--line-soft); border-radius: 3px; }
-.wf-bar { position: absolute; top: 2px; bottom: 2px; border-radius: 3px; min-width: 2px; }
+.wf-track {
+  position: relative;
+  height: 26px;
+  background-image: linear-gradient(to right, var(--line-soft) 1px, transparent 1px);
+  background-size: 25% 100%;
+}
+.wf-bar { position: absolute; top: 6px; bottom: 6px; border-radius: 1px; min-width: 2px; }
 .wf-bar.err { background: var(--danger) !important; }
 
 .wf-dur {
@@ -372,20 +405,16 @@ button, input, select { font-family: inherit; font-weight: inherit; }
 }
 
 .wf-attrs {
-  margin: 2px 14px 8px;
-  padding: 8px 10px;
+  padding: 6px 10px 8px 36px;
   background: var(--bg);
-  border: 1px solid var(--line-soft);
-  border-radius: 8px;
+  border-bottom: 1px solid var(--line);
   display: grid;
   grid-template-columns: max-content 1fr;
   gap: 2px 14px;
-  font-family: var(--mono);
   font-size: 11.5px;
   color: var(--ink-2);
   overflow-wrap: anywhere;
 }
-
 .wf-attrs .k { color: var(--muted); }
 
 /* --- trace header bits --- */
@@ -396,25 +425,23 @@ button, input, select { font-family: inherit; font-weight: inherit; }
   color: var(--ink-2);
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 2px;
   padding: 2px 7px;
   cursor: pointer;
 }
-
 .trace-id:hover { border-color: var(--brand); color: var(--brand); }
 
 .btn {
-  height: 28px;
+  height: 26px;
   padding: 0 10px;
   border: 1px solid var(--line);
-  border-radius: 7px;
+  border-radius: 2px;
   background: var(--panel);
   color: var(--ink-2);
   font: inherit;
   font-size: 12px;
   cursor: pointer;
 }
-
 .btn:hover { border-color: var(--brand); color: var(--brand); }
 
 /* --- toast --- */
@@ -440,3 +467,5 @@ button, input, select { font-family: inherit; font-weight: inherit; }
 .link:hover { text-decoration: underline; }
 .mono { font-family: var(--mono); }
 .muted { color: var(--muted); }
+
+.wf-name .sw, .tmeta .sw { width: 9px; height: 9px; flex: none; display: inline-block; }
