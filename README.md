@@ -27,7 +27,21 @@ saturation, per-signal independence), config
 precedence and failure modes, and end-to-end ingest (real server + node OTLP SDK emitter,
 protocol edges, SIGKILL crash recovery, backpressure). The emitter tests need node + pnpm.
 
+## UI
+
+SolidJS + uPlot, embedded into the binary from `ui/dist` (include_dir).
+Charts: stacked span histogram with group-by and exemplar trace ids, metric
+lines on a shared bucket grid. `from`/`to`/`svcs`/`refresh` live in the URL.
+
+    pnpm --dir ui install        # once
+    pnpm --dir ui build          # required before cargo build (placeholder 503 otherwise)
+    pnpm --dir ui dev            # vite dev server, proxies /api to :4318
+
+cargo picks up `ui/dist` changes via rerun-if-changed entries from build.rs.
+The docker build compiles the UI in a node stage first.
+
 ## Docker
+
 
     docker build -t microtel .
     docker run --rm -p 4318:4318 -v "$PWD/data:/data" microtel --storage-dir /data --listen 0.0.0.0:4318

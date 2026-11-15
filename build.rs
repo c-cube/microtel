@@ -10,6 +10,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ROCKSDB_LIB_DIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG");
 
+    // the embedded ui is not in cargo's fingerprint: list its files so a
+    // rebuilt dist actually relinks the binary
+    let dist = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("ui/dist");
+    if dist.is_dir() {
+        for path in list_files(&dist) {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
     let Ok(from_env) = std::env::var("ROCKSDB_LIB_DIR") else {
         return;
     };
@@ -23,6 +32,25 @@ fn main() {
             println!("cargo:rustc-link-arg={}", path.display());
         }
     }
+}
+
+fn list_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 fn pkg_config_libdir() -> Option<PathBuf> {
