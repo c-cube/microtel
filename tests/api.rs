@@ -5,6 +5,7 @@ use microtel::keys;
 use microtel::proto::{AttrSet, MetricKind, NumberDataPoint, Resource, SpanEnvelope, hash16};
 use microtel::query::{self, GroupBy};
 use microtel::store::{MetricBatch, PointRow, SeriesRow, SpanBatch, SpanRow, Store};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::metrics::v1 as otel_metrics;
 use opentelemetry_proto::tonic::trace::v1::Span;
 use prost::Message;
@@ -522,4 +523,156 @@ fn pick_bucket_steps_are_sane() {
     assert_eq!(query::pick_bucket_ms(180_000), 1_000);
     assert_eq!(query::pick_bucket_ms(21_600_000), 120_000);
     assert_eq!(query::pick_bucket_ms(35 * 86_400_000), 10_800_000);
+}
+
+// --- trace lookup ---
+
+fn hex_id(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn trace_lookup_flat_sorted_with_service() {
+    let (_dir, store) = store();
+    let (h, r) = res("svc-a");
+    let trace = [7u8; 16];
+    let root = [1u8; 8];
+    let child = [2u8; 8];
+
+    let env = |span: [u8; 8],
+               parent: Option<[u8; 8]>,
+               name: &str,
+               start_ns: u64,
+               attrs: Vec<KeyValue>| {
+        SpanEnvelope {
+            resource_hash: h.to_vec(),
+            scope_hash: vec![0xBB; 16],
+            span: Some(Span {
+                trace_id: trace.to_vec(),
+                span_id: span.to_vec(),
+                parent_span_id: parent.map(|p| p.to_vec()).unwrap_or_default(),
+                name: name.into(),
+                start_time_unix_nano: start_ns,
+                end_time_unix_nano: start_ns + 5_000_000,
+                attributes: attrs,
+                ..Default::default()
+            }),
+        }
+    };
+
+    let rows = vec![
+        SpanRow {
+            ymd: keys::ymd(ns(BASE_MS, 0)),
+            trace_id: trace.to_vec(),
+            span_id: root.to_vec(),
+            start_ns: ns(BASE_MS, 0),
+            envelope: env(
+                root,
+                None,
+                "root-op",
+                ns(BASE_MS, 0),
+                vec![kv("http.method", "GET")],
+            )
+            .encode_to_vec(),
+        },
+        SpanRow {
+            ymd: keys::ymd(ns(BASE_MS, 10)),
+            trace_id: trace.to_vec(),
+            span_id: child.to_vec(),
+            start_ns: ns(BASE_MS, 10),
+            envelope: env(child, Some(root), "child-op", ns(BASE_MS, 10), Vec::new())
+                .encode_to_vec(),
+        },
+    ];
+    store.apply_traces(&batch(vec![(h, r)], rows)).unwrap();
+
+    let tid = hex_id(&trace);
+    let spans = query::trace(&store, &tid, BASE_MS).unwrap();
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].span_id, hex_id(&root));
+    assert_eq!(spans[0].parent_span_id, None);
+    assert_eq!(spans[0].name, "root-op");
+    assert_eq!(spans[0].service, "svc-a");
+    assert_eq!(spans[0].duration_ns, 5_000_000);
+    assert_eq!(
+        spans[0].attrs.get("http.method").map(String::as_str),
+        Some("GET")
+    );
+    assert_eq!(
+        spans[1].parent_span_id.as_deref(),
+        Some(hex_id(&root).as_str())
+    );
+
+    assert!(matches!(
+        query::trace(&store, "zz", BASE_MS),
+        Err(query::TraceError::BadId)
+    ));
+    assert!(matches!(
+        query::trace(&store, &"0".repeat(32), BASE_MS),
+        Err(query::TraceError::NotFound)
+    ));
+}
+
+#[test]
+fn trace_http_statuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let store = Store::open(dir.path()).expect("open");
+        let (h, r) = res("svc-a");
+        let trace = [9u8; 16];
+        let span = [5u8; 8];
+        let now = common::now_ns();
+        store
+            .apply_traces(&batch(
+                vec![(h, r)],
+                vec![SpanRow {
+                    ymd: keys::ymd(now),
+                    trace_id: trace.to_vec(),
+                    span_id: span.to_vec(),
+                    start_ns: now,
+                    envelope: SpanEnvelope {
+                        resource_hash: h.to_vec(),
+                        scope_hash: vec![0xBB; 16],
+                        span: Some(Span {
+                            trace_id: trace.to_vec(),
+                            span_id: span.to_vec(),
+                            name: "op".into(),
+                            start_time_unix_nano: now,
+                            end_time_unix_nano: now + 1_000_000,
+                            ..Default::default()
+                        }),
+                    }
+                    .encode_to_vec(),
+                }],
+            ))
+            .unwrap();
+    }
+    let (mut child, addr) = spawn_server(dir.path(), None);
+    let at = common::now_ns() / 1_000_000;
+    let id = hex_id(&[9u8; 16]);
+
+    let spans: serde_json::Value = ureq::get(&format!("http://{addr}/api/traces/{id}?at={at}"))
+        .call()
+        .expect("trace 200")
+        .into_json()
+        .expect("trace json");
+    assert_eq!(spans.as_array().expect("array").len(), 1);
+    assert_eq!(spans[0]["name"], "op");
+    assert_eq!(spans[0]["service"], "svc-a");
+
+    let code = match ureq::get(&format!("http://{addr}/api/traces/{}", "0".repeat(32))).call() {
+        Ok(_) => panic!("unknown trace must 404"),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => panic!("transport error: {e}"),
+    };
+    assert_eq!(code, 404);
+
+    let code = match ureq::get(&format!("http://{addr}/api/traces/zz")).call() {
+        Ok(_) => panic!("bad hex must 400"),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => panic!("transport error: {e}"),
+    };
+    assert_eq!(code, 400);
+
+    common::terminate(&mut child);
 }

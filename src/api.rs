@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -23,6 +23,7 @@ pub fn router(store: Arc<Store>) -> Router {
         .route("/api/spans/barchart", get(barchart))
         .route("/api/metrics/series", get(series))
         .route("/api/metrics/points", get(points))
+        .route("/api/traces/{trace_id}", get(trace))
         .fallback(ui)
         .with_state(store)
 }
@@ -88,6 +89,29 @@ async fn barchart(
         query::SCAN_CAP,
     ))
     .into_response()
+}
+
+async fn trace(
+    State(store): State<Arc<Store>>,
+    Path(trace_id): Path<String>,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    let at = match param(&p, "at") {
+        Some(s) => match s.parse::<u64>() {
+            Ok(v) => v,
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid at").into_response(),
+        },
+        None => now_ms(),
+    };
+    match query::trace(&store, &trace_id, at) {
+        Ok(spans) => Json(spans).into_response(),
+        Err(query::TraceError::BadId) => {
+            (StatusCode::BAD_REQUEST, "invalid trace id").into_response()
+        }
+        Err(query::TraceError::NotFound) => {
+            (StatusCode::NOT_FOUND, "trace not found").into_response()
+        }
+    }
 }
 
 async fn series(State(store): State<Arc<Store>>) -> Response {

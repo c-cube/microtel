@@ -9,8 +9,9 @@ use std::fmt::Write as _;
 use opentelemetry_proto::tonic::common::v1::any_value;
 use prost::Message as _;
 use serde::Serialize;
+use time::{Date, Month};
 
-use crate::keys::{self, HASH_LEN};
+use crate::keys::{self, HASH_LEN, TRACE_ID_LEN};
 use crate::proto::{AttrSet, MetricKind, NumberDataPoint, SpanEnvelope};
 use crate::store::{CF_POINTS, CF_RESOURCES, CF_SERIES, CF_SPAN_TIME, CF_SPAN_TRACE, Store};
 
@@ -97,6 +98,118 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{:02x}", b);
     }
     s
+}
+
+/// YYYYMMDD back into a calendar date.
+fn ymd_date(ymd: u32) -> Option<Date> {
+    Date::from_calendar_date(
+        (ymd / 10_000) as i32,
+        Month::try_from((ymd / 100 % 100) as u8).ok()?,
+        (ymd % 100) as u8,
+    )
+    .ok()
+}
+
+#[derive(Serialize)]
+pub struct TraceSpan {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub service: String,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub duration_ns: u64,
+    pub attrs: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+pub enum TraceError {
+    BadId,
+    NotFound,
+}
+
+/// A trace crossing midnight lands under several date prefixes; check the
+/// hinted date and both neighbours.
+pub fn trace(store: &Store, trace_id_hex: &str, at_ms: u64) -> Result<Vec<TraceSpan>, TraceError> {
+    let tid = decode_hex(trace_id_hex).ok_or(TraceError::BadId)?;
+    let hinted = keys::ymd(at_ms.saturating_mul(1_000_000));
+    let mut dates = vec![hinted];
+    if let Some(d) = ymd_date(hinted) {
+        if let Some(p) = d.previous_day() {
+            dates.push(keys::ymd_of(p));
+        }
+        if let Some(n) = d.next_day() {
+            dates.push(keys::ymd_of(n));
+        }
+    }
+
+    let mut svc_memo: HashMap<[u8; HASH_LEN], String> = HashMap::new();
+    let mut spans = Vec::new();
+    for ymd in dates {
+        let seek = keys::span_trace_key(ymd, &tid, &[]);
+        for (key, value) in store.scan_from(CF_SPAN_TRACE, &seek) {
+            if key.len() != 28 {
+                continue;
+            }
+            let ky = u32::from_be_bytes(key[0..4].try_into().expect("4 bytes"));
+            let t = &key[4..20];
+            if t != &tid[..] || ky != ymd {
+                break;
+            }
+            let Some(env) = SpanEnvelope::decode(&value[..]).ok() else {
+                continue;
+            };
+            let Some(span) = env.span else { continue };
+            let rh: [u8; HASH_LEN] = env
+                .resource_hash
+                .as_slice()
+                .try_into()
+                .unwrap_or([0; HASH_LEN]);
+            let service = match svc_memo.get(&rh) {
+                Some(s) => s.clone(),
+                None => {
+                    let s = service_of(store, &rh).unwrap_or_else(|| "unknown".into());
+                    svc_memo.insert(rh, s.clone());
+                    s
+                }
+            };
+            spans.push(TraceSpan {
+                trace_id: trace_id_hex.to_string(),
+                span_id: hex(&key[20..28]),
+                parent_span_id: (!span.parent_span_id.is_empty())
+                    .then(|| hex(&span.parent_span_id)),
+                name: span.name,
+                service,
+                start_ns: span.start_time_unix_nano,
+                end_ns: span.end_time_unix_nano,
+                duration_ns: span
+                    .end_time_unix_nano
+                    .saturating_sub(span.start_time_unix_nano),
+                attrs: attr_map(&span.attributes),
+            });
+        }
+    }
+    if spans.is_empty() {
+        return Err(TraceError::NotFound);
+    }
+    spans.sort_by(|a, b| {
+        a.start_ns
+            .cmp(&b.start_ns)
+            .then_with(|| a.span_id.cmp(&b.span_id))
+    });
+    Ok(spans)
+}
+
+fn decode_hex(s: &str) -> Option<[u8; TRACE_ID_LEN]> {
+    if s.len() != TRACE_ID_LEN * 2 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; TRACE_ID_LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 fn attr_map(kvs: &[opentelemetry_proto::tonic::common::v1::KeyValue]) -> BTreeMap<String, String> {
