@@ -52,6 +52,9 @@ export interface TraceSpan {
   parent_span_id?: string | null;
   name: string;
   service: string;
+  kind: number;
+  error: boolean;
+  status_message: string;
   start_ns: number;
   end_ns: number;
   duration_ns: number;

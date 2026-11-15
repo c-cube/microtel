@@ -1,6 +1,8 @@
 /* @refresh reload */
 import { render } from "solid-js/web";
 import { Navigate, Route, Router } from "@solidjs/router";
+import "uplot/dist/uPlot.min.css";
+import "./theme.css";
 import Layout from "./App";
 import Spans from "./pages/Spans";
 import Metrics from "./pages/Metrics";
