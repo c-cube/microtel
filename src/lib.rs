@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod ingest;
 pub mod keys;
+pub mod logging;
 pub mod pipeline;
 pub mod proto;
 pub mod purge;

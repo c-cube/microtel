@@ -139,16 +139,22 @@ pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String) {
         cmd.arg("--listen").arg("127.0.0.1:0");
     }
     let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn microtel");
-    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
     let deadline = Instant::now() + Duration::from_secs(15);
-    let reader = std::io::BufReader::new(stdout);
+    let mut reader = std::io::BufReader::new(stderr);
     let mut addr: Option<String> = None;
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
+    let mut seen = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        seen.push_str(&line);
         if let Some(a) = line.split("listening on ").nth(1) {
             addr = Some(a.trim().to_string());
             break;
@@ -157,9 +163,15 @@ pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String) {
             break;
         }
     }
+    // keep draining the child's stderr so it never blocks on a full pipe
+    std::thread::spawn(move || {
+        for line in reader.lines().map_while(Result::ok) {
+            eprintln!("{line}");
+        }
+    });
     let Some(addr) = addr else {
         let _ = child.wait();
-        panic!("server did not report its address");
+        panic!("server did not report its address; stderr:\n{seen}");
     };
     (child, addr)
 }

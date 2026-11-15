@@ -123,6 +123,7 @@ fn barchart_counts_groups_by_service() {
         GroupBy::Service,
         &[],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(chart.bucket_ms, 120_000);
     assert!(!chart.truncated);
@@ -159,6 +160,7 @@ fn barchart_group_by_none_and_name() {
         GroupBy::None,
         &[],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(none.labels, vec!["spans"]);
     assert_eq!(bucket_total(&none, "spans")[0], 1);
@@ -171,6 +173,7 @@ fn barchart_group_by_none_and_name() {
         GroupBy::Name,
         &[],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(by_name.labels, vec!["op-a", "op-b"]);
 }
@@ -197,6 +200,7 @@ fn barchart_filters_by_selected_services() {
         GroupBy::Service,
         &["svc-b".to_string()],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(chart.labels, vec!["svc-b"]);
     assert_eq!(bucket_total(&chart, "svc-b")[0], 1);
@@ -223,6 +227,7 @@ fn barchart_exemplars_are_first_seen_per_bucket_and_group() {
         GroupBy::Service,
         &[],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(chart.exemplars.len(), 2);
     let first = &chart.exemplars[0];
@@ -252,6 +257,7 @@ fn barchart_folds_tail_groups_into_other() {
         GroupBy::Service,
         &[],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(chart.labels.len(), 13);
     assert_eq!(chart.labels.last().unwrap(), "other");
@@ -282,6 +288,7 @@ fn barchart_reports_truncation_at_cap() {
         GroupBy::Service,
         &[],
         5,
+        None,
     );
     assert!(chart.truncated);
     let total: u64 = bucket_total(&chart, "svc-a").iter().sum();
@@ -361,6 +368,7 @@ fn points_gauge_averages_and_sum_takes_last_per_bucket() {
         BASE_MS + RANGE_MS,
         &[],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(g.lines.len(), 1);
     assert_eq!(g.lines[0].label, "service.name=svc-a");
@@ -375,6 +383,7 @@ fn points_gauge_averages_and_sum_takes_last_per_bucket() {
         BASE_MS + RANGE_MS,
         &[],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(s.lines[0].y[0], Some(9.0));
     assert_eq!(s.lines[0].y[1], None);
@@ -409,6 +418,7 @@ fn points_filter_by_service_and_sort_lines_by_label() {
         BASE_MS + RANGE_MS,
         &[],
         query::SCAN_CAP,
+        None,
     );
     let labels: Vec<&str> = all.lines.iter().map(|l| l.label.as_str()).collect();
     assert_eq!(labels, vec!["service.name=aaa", "service.name=zzz"]);
@@ -420,6 +430,7 @@ fn points_filter_by_service_and_sort_lines_by_label() {
         BASE_MS + RANGE_MS,
         &["aaa".to_string()],
         query::SCAN_CAP,
+        None,
     );
     assert_eq!(filtered.lines.len(), 1);
     assert_eq!(filtered.lines[0].label, "service.name=aaa");
@@ -504,6 +515,18 @@ fn api_serves_charts_and_validates_params() {
         )),
         400
     );
+    assert_eq!(
+        status_of(format!(
+            "http://{addr}/api/spans/barchart?from={from}&to={to}&buckets=nope"
+        )),
+        400
+    );
+    assert_eq!(
+        status_of(format!(
+            "http://{addr}/api/metrics/points?name=x&from={from}&to={to}&buckets=nope"
+        )),
+        400
+    );
     assert_eq!(status_of(format!("http://{addr}/api/nope")), 404);
 
     // the SPA fallback answers every client route with the embedded index
@@ -543,7 +566,8 @@ fn trace_lookup_flat_sorted_with_service() {
                parent: Option<[u8; 8]>,
                name: &str,
                start_ns: u64,
-               attrs: Vec<KeyValue>| {
+               attrs: Vec<KeyValue>,
+               code: i32| {
         SpanEnvelope {
             resource_hash: h.to_vec(),
             scope_hash: vec![0xBB; 16],
@@ -555,6 +579,11 @@ fn trace_lookup_flat_sorted_with_service() {
                 start_time_unix_nano: start_ns,
                 end_time_unix_nano: start_ns + 5_000_000,
                 attributes: attrs,
+                kind: 3,
+                status: (code != 0).then(|| opentelemetry_proto::tonic::trace::v1::Status {
+                    code,
+                    message: "card_declined".into(),
+                }),
                 ..Default::default()
             }),
         }
@@ -572,6 +601,7 @@ fn trace_lookup_flat_sorted_with_service() {
                 "root-op",
                 ns(BASE_MS, 0),
                 vec![kv("http.method", "GET")],
+                1,
             )
             .encode_to_vec(),
         },
@@ -580,8 +610,15 @@ fn trace_lookup_flat_sorted_with_service() {
             trace_id: trace.to_vec(),
             span_id: child.to_vec(),
             start_ns: ns(BASE_MS, 10),
-            envelope: env(child, Some(root), "child-op", ns(BASE_MS, 10), Vec::new())
-                .encode_to_vec(),
+            envelope: env(
+                child,
+                Some(root),
+                "child-op",
+                ns(BASE_MS, 10),
+                Vec::new(),
+                2,
+            )
+            .encode_to_vec(),
         },
     ];
     store.apply_traces(&batch(vec![(h, r)], rows)).unwrap();
@@ -594,6 +631,10 @@ fn trace_lookup_flat_sorted_with_service() {
     assert_eq!(spans[0].name, "root-op");
     assert_eq!(spans[0].service, "svc-a");
     assert_eq!(spans[0].duration_ns, 5_000_000);
+    assert!(!spans[0].error);
+    assert_eq!(spans[0].status_message, "card_declined");
+    assert_eq!(spans[0].kind, 3);
+    assert!(spans[1].error);
     assert_eq!(
         spans[0].attrs.get("http.method").map(String::as_str),
         Some("GET")
@@ -675,4 +716,45 @@ fn trace_http_statuses() {
     assert_eq!(code, 400);
 
     common::terminate(&mut child);
+}
+
+#[test]
+fn bucket_count_is_client_driven_and_capped() {
+    let (_dir, store) = store();
+
+    let chart = query::barchart(
+        &store,
+        BASE_MS,
+        BASE_MS + 3_600_000,
+        GroupBy::Service,
+        &[],
+        query::SCAN_CAP,
+        Some(20),
+    );
+    // 1h / 20 -> a snapped 3m step, so exactly 20 buckets
+    assert_eq!(chart.bucket_ms, 180_000);
+    assert_eq!(chart.buckets[0].len(), 20);
+
+    let fine = query::barchart(
+        &store,
+        BASE_MS,
+        BASE_MS + 3_600_000,
+        GroupBy::Service,
+        &[],
+        query::SCAN_CAP,
+        Some(100_000),
+    );
+    assert!(fine.buckets[0].len() <= query::MAX_BUCKETS);
+    assert_eq!(fine.bucket_ms, query::pick_bucket_ms(3_600_000));
+
+    let coarse = query::barchart(
+        &store,
+        BASE_MS,
+        BASE_MS + 3_600_000,
+        GroupBy::Service,
+        &[],
+        query::SCAN_CAP,
+        Some(1),
+    );
+    assert!(coarse.buckets[0].len() <= 12);
 }

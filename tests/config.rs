@@ -25,14 +25,14 @@ fn listening_addr(args: &[&str]) -> String {
     let exe = env!("CARGO_BIN_EXE_microtel");
     let mut child = Command::new(exe)
         .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("microtel spawns");
-    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut addr = None;
-    for line in std::io::BufReader::new(stdout).lines() {
+    for line in std::io::BufReader::new(stderr).lines() {
         let Ok(line) = line else { break };
         if let Some(a) = line.split("listening on ").nth(1) {
             addr = Some(a.trim().to_string());

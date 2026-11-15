@@ -13,12 +13,12 @@ pub async fn purge_task(store: Arc<Store>, ttl_days: u32, interval_secs: u64) {
             .date()
             .checked_sub(SignedDuration::days(i64::from(ttl_days)))
         else {
-            tracing::warn!(ttl_days, "ttl reaches before year 0; skipping purge");
+            log::warn!("ttl reaches before year 0; skipping purge (ttl_days={ttl_days})");
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
             continue;
         };
         if let Err(e) = store.purge_before(cutoff) {
-            tracing::warn!(error = %e, cutoff = %cutoff, "purge failed");
+            log::warn!("purge failed: {e} (cutoff={cutoff})");
         }
         tokio::time::sleep(Duration::from_secs(interval_secs)).await;
     }

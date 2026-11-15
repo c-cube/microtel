@@ -133,7 +133,7 @@ async fn flush<T: Stored>(store: &Store, buf: &mut VecDeque<T>, queued: &AtomicU
         if retry(|| batch.store(store), MAX_ATTEMPTS).await.is_ok() {
             batch.tally(stats, true);
         } else {
-            tracing::error!("flush failed after retries; batch dropped");
+            log::error!("flush failed after retries; batch dropped");
             batch.tally(stats, false);
         }
     }
@@ -147,7 +147,7 @@ async fn retry<T, F: FnMut() -> DbResult<T>>(mut f: F, max_attempts: u32) -> DbR
         match f() {
             Ok(v) => return Ok(v),
             Err(e) if attempt < max_attempts => {
-                tracing::warn!(error = %e, attempt, "write failed; retrying");
+                log::warn!("write failed; retrying (attempt={attempt}): {e}");
                 tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt))).await;
                 attempt += 1;
             }

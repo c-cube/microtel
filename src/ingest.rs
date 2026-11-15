@@ -86,7 +86,7 @@ async fn traces_inner(app: &App, headers: &HeaderMap, body: Bytes) -> Response {
                     || zero(&span.trace_id)
                     || zero(&span.span_id)
                 {
-                    tracing::warn!("dropping span with invalid ids");
+                    log::warn!("dropping span with invalid ids");
                     invalid += 1;
                     continue;
                 }
@@ -159,7 +159,7 @@ async fn metrics_inner(app: &App, headers: &HeaderMap, body: Bytes) -> Response 
                     Some(Data::Gauge(g)) => (MetricKind::Gauge, g.data_points),
                     Some(Data::Sum(s)) => (MetricKind::Sum, s.data_points),
                     _ => {
-                        tracing::debug!(name = %name, "metric type not stored");
+                        log::debug!("metric type not stored (name={name})");
                         continue;
                     }
                 };
@@ -250,7 +250,7 @@ fn decompress(headers: &HeaderMap, body: &Bytes) -> std::io::Result<Vec<u8>> {
     if declared {
         gunzip(body)
     } else if magic {
-        tracing::warn!("gzip body without content-encoding: gzip");
+        log::warn!("gzip body without content-encoding: gzip");
         gunzip(body)
     } else {
         Ok(body.to_vec())

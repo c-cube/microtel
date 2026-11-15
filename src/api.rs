@@ -80,6 +80,10 @@ async fn barchart(
         Some(by) => by,
         None => return (StatusCode::BAD_REQUEST, "invalid group_by").into_response(),
     };
+    let buckets = match bucket_param(&p) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     Json(query::barchart(
         &store,
         from,
@@ -87,6 +91,7 @@ async fn barchart(
         by,
         &svcs(&p),
         query::SCAN_CAP,
+        buckets,
     ))
     .into_response()
 }
@@ -130,6 +135,10 @@ async fn points(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
+    let buckets = match bucket_param(&p) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     Json(query::points(
         &store,
         name,
@@ -137,8 +146,20 @@ async fn points(
         to,
         &svcs(&p),
         query::SCAN_CAP,
+        buckets,
     ))
     .into_response()
+}
+
+/// Optional `buckets` hint; the server clamps it to a sane range.
+fn bucket_param(p: &HashMap<String, String>) -> Result<Option<usize>, (StatusCode, &'static str)> {
+    match param(p, "buckets") {
+        Some(s) => s
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid buckets")),
+        None => Ok(None),
+    }
 }
 
 fn content_type(path: &str) -> &'static str {
