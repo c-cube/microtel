@@ -60,19 +60,25 @@ export default function Spans() {
   const activePreset = () => PRESETS.find(([, ms]) => toMs() - fromMs() === ms)?.[0];
 
   // exemplar lookup keyed by bucket start + group label
-  const exemplarAt = (idx: number, label: string): string | undefined => {
+  const findExemplar = (idx: number, label: string) => {
     const c = chart();
     if (!c) return undefined;
     const t = c.buckets[0]?.[idx];
-    const ex = c.exemplars.find((e) => e.t === t && e.label === label);
-    return ex ? `↳ trace ${ex.trace_id.slice(0, 12)}…` : undefined;
+    return c.exemplars.find((e) => e.t === t && e.label === label);
+  };
+
+  const exemplarText = (idx: number, label: string): string | undefined => {
+    const ex = findExemplar(idx, label);
+    return ex ? `trace ${ex.trace_id.slice(0, 12)}…` : undefined;
+  };
+
+  const exemplarHref = (idx: number, label: string): string | undefined => {
+    const ex = findExemplar(idx, label);
+    return ex ? `/trace/${ex.trace_id}?at=${ex.t}` : undefined;
   };
 
   const pickExemplar = (idx: number, label: string) => {
-    const c = chart();
-    if (!c) return;
-    const t = c.buckets[0]?.[idx];
-    const ex = c.exemplars.find((e) => e.t === t && e.label === label);
+    const ex = findExemplar(idx, label);
     if (ex) void navigator.clipboard.writeText(ex.trace_id);
     setCopied(`${label}: ${ex ? ex.trace_id.slice(0, 12) + "…" : "(none)"} copied`);
   };
@@ -164,7 +170,8 @@ export default function Spans() {
         t={chart()?.buckets[0] ?? []}
         series={plotSeries()}
         bars
-        tipExemplar={exemplarAt}
+        tipExemplar={exemplarText}
+        tipLink={exemplarHref}
         onPick={pickExemplar}
       />
 

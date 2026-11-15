@@ -29,6 +29,8 @@ export interface PlotProps {
   height?: number;
   // extra tooltip line for a (bucket, label); e.g. exemplar trace ids
   tipExemplar?: (idx: number, label: string) => string | undefined;
+  // href for the exemplar line (trace page); renders as a link when set
+  tipLink?: (idx: number, label: string) => string | undefined;
   // bar-segment click (spans page): copy the segment's exemplar trace id
   onPick?: (idx: number, label: string) => void;
 }
@@ -153,7 +155,12 @@ export default function Plot(props: PlotProps) {
                   v == null ? "–" : fmtCount(v)
                 }`;
                 const ex = props.tipExemplar?.(idx, label);
-                if (ex) html += `<br><span style="opacity:.6">↳ ${ex}</span>`;
+                if (ex) {
+                  const href = props.tipLink?.(idx, label);
+                  html += href
+                    ? `<br><a href="${href}" style="opacity:.7">↳ ${ex}</a>`
+                    : `<br><span style="opacity:.6">↳ ${ex}</span>`;
+                }
               }
               tip.innerHTML = html;
               tip.style.display = "block";
