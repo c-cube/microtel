@@ -3,7 +3,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends clang libclang-dev librocksdb-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY .cargo .cargo
+# librocksdb-sys reads these while it is built, so they must be plain ENV: a
+# build.rs cannot influence its vendored-vs-system choice.
+ENV ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu \
+    ROCKSDB_INCLUDE_DIR=/usr/include \
+    ROCKSDB_STATIC=1 \
+    SNAPPY_LIB_DIR=/usr/lib/x86_64-linux-gnu \
+    SNAPPY_STATIC=1
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src src
 RUN cargo build --release && strip target/release/microtel

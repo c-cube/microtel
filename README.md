@@ -34,8 +34,25 @@ protocol edges, SIGKILL crash recovery, backpressure). The emitter tests need no
 
 Builder links against the distro's static `librocksdb.a` (`librocksdb-dev` + its
 `libsnappy-dev`/`libzstd-dev`/`liblz4-dev`/`libbz2-dev` deps) to skip the vendored C++
-build. The `ROCKSDB_*`/`SNAPPY_*` env in `.cargo/config.toml` is what makes
-`librocksdb-sys` pick the system libraries — it reads them while *it* is built, so a
-`build.rs` cannot influence that choice. `build.rs` only adds the compression archives to
-the final link (via `pkg-config` libdir, falling back to `ROCKSDB_LIB_DIR`). Remove the
-`[env]` block to fall back to the vendored build.
+build. The image sets the `ROCKSDB_*`/`SNAPPY_*` ENV itself, so it needs no
+cargo config. Local builds are another matter: `librocksdb-sys` picks system vs
+vendored libraries while *it* is built, so a `build.rs` cannot influence that
+choice — it has to be set in `.cargo/config.toml` before cargo starts. That file
+is machine-local and gitignored; without it cargo falls back to the vendored C++
+build (slow, needs clang). To use the distro rocksdb on Debian/Ubuntu amd64:
+
+    mkdir -p .cargo && cat > .cargo/config.toml <<'EOF'
+    # librocksdb-sys reads these while it is built, so they must be set before cargo
+    # starts: build.rs cannot influence its vendored-vs-system choice.
+    [env]
+    ROCKSDB_LIB_DIR = "/usr/lib/x86_64-linux-gnu"
+    ROCKSDB_INCLUDE_DIR = "/usr/include"
+    ROCKSDB_STATIC = "1"
+    SNAPPY_LIB_DIR = "/usr/lib/x86_64-linux-gnu"
+    SNAPPY_STATIC = "1"
+    EOF
+
+`build.rs` only adds the compression archives to the final link (via `pkg-config`
+libdir, falling back to `ROCKSDB_LIB_DIR`). Note the `[env]` block is part of
+cargo's build fingerprint: changing it dirties `librocksdb-sys`, deleting it
+silently switches to the vendored build.
