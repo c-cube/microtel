@@ -2,25 +2,25 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use rocksdb::{
-    BlockBasedOptions, ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, MergeOperands,
-    Options, WriteBatch,
+    BlockBasedOptions, ColumnFamilyDescriptor, DB, DBCompressionType, Direction, IteratorMode,
+    MergeOperands, Options, WriteBatch,
 };
 use time::Date;
 
 use crate::keys;
 
 /// `spans_by_trace` key: `date | trace_id | span_id` -> `SpanEnvelope`.
-const CF_SPAN_TRACE: &str = "spans_by_trace";
+pub const CF_SPAN_TRACE: &str = "spans_by_trace";
 /// `spans_by_time` key: `date | start_ns | trace_id` -> packed span ids (merged).
-const CF_SPAN_TIME: &str = "spans_by_time";
+pub const CF_SPAN_TIME: &str = "spans_by_time";
 /// `resources` key: `blake3(resource proto)[..16]` -> raw `Resource` proto.
-const CF_RESOURCES: &str = "resources";
+pub const CF_RESOURCES: &str = "resources";
 /// `scopes` key: `blake3(scope proto)[..16]` -> raw `InstrumentationScope` proto.
 const CF_SCOPES: &str = "scopes";
 /// `series` key: `varint name_len | name | attr_hash(16)` -> `AttrSet` proto.
-const CF_SERIES: &str = "series";
+pub const CF_SERIES: &str = "series";
 /// `points` key: `series prefix | date | time_ns` -> raw `NumberDataPoint` proto.
-const CF_POINTS: &str = "points";
+pub const CF_POINTS: &str = "points";
 
 const ALL_CFS: [&str; 7] = [
     "default",
@@ -161,6 +161,18 @@ impl Store {
 
     pub fn get(&self, cf: &str, key: &[u8]) -> DbResult<Option<Vec<u8>>> {
         self.db.get_cf(self.cf(cf), key)
+    }
+
+    /// Forward iterator starting at `start`; callers stop by dropping it once
+    /// their range ends. Corrupt rows end the stream (same as `count`).
+    pub fn scan_from(
+        &self,
+        cf: &str,
+        start: &[u8],
+    ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + '_ {
+        self.db
+            .iterator_cf(self.cf(cf), IteratorMode::From(start, Direction::Forward))
+            .map_while(Result::ok)
     }
 
     pub fn apply_traces(&self, batch: &SpanBatch) -> DbResult<()> {

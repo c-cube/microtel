@@ -14,8 +14,8 @@ const EXPECTED_RESOURCES: usize = 3;
 const EXPECTED_SERIES_MIN: usize = 5;
 const EXPECTED_POINTS_MIN: usize = 7;
 
-#[tokio::test]
-async fn ingest_roundtrip() {
+#[test]
+fn ingest_roundtrip() {
     // sandbox may have a read-only /tmp; keep tempdirs inside the repo
     let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp");
     std::fs::create_dir_all(&repo_tmp).unwrap();
@@ -26,7 +26,7 @@ async fn ingest_roundtrip() {
     let data_dir = dir.path().join("data");
     let (mut child, addr) = common::spawn_server(&data_dir, None);
     let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let agent = test_agent();
     let pb = "application/x-protobuf";
 
     let t0 = common::now_ns();
@@ -42,72 +42,63 @@ async fn ingest_roundtrip() {
         common::span([1u8; 16], [1u8; 8], "root-ok", t0),
         dropped_span,
     ]);
-    let resp = client
-        .post(format!("{base}/v1/traces"))
-        .header(reqwest::header::CONTENT_TYPE, pb)
-        .body(req.encode_to_vec())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers()["content-type"], pb);
-    let body = resp.bytes().await.unwrap();
-    assert!(body.is_empty(), "success response must be an empty proto");
+    let reply = post(&agent, &base, "/v1/traces", Some(pb), req.encode_to_vec());
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.content_type.as_deref(), Some(pb));
+    assert!(
+        reply.body.is_empty(),
+        "success response must be an empty proto"
+    );
 
     // gzip'd trace request: 1 more span
     let req = common::trace_request(vec![common::span([2u8; 16], [1u8; 8], "root-gzip", t0)]);
-    let resp = client
-        .post(format!("{base}/v1/traces"))
-        .header(reqwest::header::CONTENT_TYPE, pb)
-        .body(common::gzip(&req.encode_to_vec()))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let reply = post(
+        &agent,
+        &base,
+        "/v1/traces",
+        Some(pb),
+        common::gzip(&req.encode_to_vec()),
+    );
+    assert_eq!(reply.status, 200);
 
     // gzip'd metrics request: 2 series, 2 points
     let req = common::metrics_request(vec![
         common::gauge_metric("rust_gauge", vec![common::kv("env", "test")], t0),
         common::sum_metric("rust_sum", t0),
     ]);
-    let resp = client
-        .post(format!("{base}/v1/metrics"))
-        .header(reqwest::header::CONTENT_TYPE, pb)
-        .body(common::gzip(&req.encode_to_vec()))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let reply = post(
+        &agent,
+        &base,
+        "/v1/metrics",
+        Some(pb),
+        common::gzip(&req.encode_to_vec()),
+    );
+    assert_eq!(reply.status, 200);
 
     // rejection paths
-    let resp = client
-        .post(format!("{base}/v1/logs"))
-        .body("[]")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 501);
-    let resp = client
-        .post(format!("{base}/v1/traces"))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 415);
-    let resp = client
-        .post(format!("{base}/v1/traces"))
-        .header(reqwest::header::CONTENT_TYPE, pb)
-        .body(b"definitely-not-proto".to_vec())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400);
+    let reply = post(&agent, &base, "/v1/logs", None, b"[]".to_vec());
+    assert_eq!(reply.status, 501);
+    let reply = post(
+        &agent,
+        &base,
+        "/v1/traces",
+        Some("application/json"),
+        b"{}".to_vec(),
+    );
+    assert_eq!(reply.status, 415);
+    let reply = post(
+        &agent,
+        &base,
+        "/v1/traces",
+        Some(pb),
+        b"definitely-not-proto".to_vec(),
+    );
+    assert_eq!(reply.status, 400);
 
     common::run_emitter(&addr, A_TRACES, B_TRACES);
 
     // let the writer drain its last interval, then shut down gracefully
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    std::thread::sleep(Duration::from_millis(1500));
     let status = common::terminate(&mut child);
     assert!(
         status.success(),
@@ -205,22 +196,41 @@ fn read_varint(buf: &[u8]) -> (usize, usize) {
 
 const PB: &str = "application/x-protobuf";
 
-async fn post(
-    client: &reqwest::Client,
-    base: &str,
-    path: &str,
-    ct: Option<&str>,
-    body: Vec<u8>,
-) -> reqwest::Response {
-    let mut req = client.post(format!("{base}{path}"));
-    if let Some(ct) = ct {
-        req = req.header(reqwest::header::CONTENT_TYPE, ct);
-    }
-    req.body(body).send().await.unwrap()
+struct Reply {
+    status: u16,
+    content_type: Option<String>,
+    body: String,
 }
 
-#[tokio::test]
-async fn protocol_edges() {
+fn test_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .max_idle_connections_per_host(0)
+        .build()
+}
+
+fn send(req: ureq::Request, body: &[u8]) -> Reply {
+    let reply = |resp: ureq::Response| Reply {
+        status: resp.status(),
+        content_type: resp.header("content-type").map(String::from),
+        body: resp.into_string().unwrap_or_default(),
+    };
+    match req.send_bytes(body) {
+        Ok(resp) => reply(resp),
+        Err(ureq::Error::Status(_, resp)) => reply(resp),
+        Err(e) => panic!("transport error: {e}"),
+    }
+}
+
+fn post(agent: &ureq::Agent, base: &str, path: &str, ct: Option<&str>, body: Vec<u8>) -> Reply {
+    let mut req = agent.post(&format!("{base}{path}"));
+    if let Some(ct) = ct {
+        req = req.set("Content-Type", ct);
+    }
+    send(req, &body)
+}
+
+#[test]
+fn protocol_edges() {
     let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp");
     std::fs::create_dir_all(&repo_tmp).unwrap();
     let dir = tempfile::Builder::new()
@@ -230,97 +240,79 @@ async fn protocol_edges() {
     let data_dir = dir.path().join("data");
     let (mut child, addr) = common::spawn_server(&data_dir, None);
     let base = format!("http://{addr}");
-    // no keep-alive reuse: the oversized-body request below gets its connection
-    // aborted, and a pooled dead connection would break the next request
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .build()
-        .unwrap();
+    let agent = test_agent();
     let t0 = common::now_ns();
 
     // content-type variants are all accepted
     let req = common::trace_request(vec![common::span([11u8; 16], [1u8; 8], "charset", t0)]);
-    let resp = post(
-        &client,
+    let reply = post(
+        &agent,
         &base,
         "/v1/traces",
         Some("application/x-protobuf; charset=utf-8"),
         req.encode_to_vec(),
-    )
-    .await;
-    assert_eq!(resp.status(), 200, "charset suffix");
+    );
+    assert_eq!(reply.status, 200, "charset suffix");
 
     let req = common::trace_request(vec![common::span([12u8; 16], [1u8; 8], "bare", t0)]);
-    let resp = post(
-        &client,
+    let reply = post(
+        &agent,
         &base,
         "/v1/traces",
         Some("application/protobuf"),
         req.encode_to_vec(),
-    )
-    .await;
-    assert_eq!(resp.status(), 200, "application/protobuf");
+    );
+    assert_eq!(reply.status, 200, "application/protobuf");
 
     // missing content-type defers to body parsing
     let req = common::trace_request(vec![common::span([13u8; 16], [1u8; 8], "noct", t0)]);
-    let resp = post(&client, &base, "/v1/traces", None, req.encode_to_vec()).await;
-    assert_eq!(resp.status(), 200, "missing content-type");
+    let reply = post(&agent, &base, "/v1/traces", None, req.encode_to_vec());
+    assert_eq!(reply.status, 200, "missing content-type");
 
     // corrupt gzip is a 400, not a panic
-    let resp = post(
-        &client,
+    let reply = post(
+        &agent,
         &base,
         "/v1/traces",
         Some(PB),
         vec![0x1f, 0x8b, 0xde, 0xad, 0xbe, 0xef],
-    )
-    .await;
-    assert_eq!(resp.status(), 400);
+    );
+    assert_eq!(reply.status, 400);
 
     // gzip bytes without a content-encoding header are still decompressed
     let req = common::trace_request(vec![common::span([51u8; 16], [1u8; 8], "sniffed", t0)]);
-    let resp = post(
-        &client,
+    let reply = post(
+        &agent,
         &base,
         "/v1/traces",
         Some(PB),
         common::gzip(&req.encode_to_vec()),
-    )
-    .await;
-    assert_eq!(resp.status(), 200, "gzip sniffed from magic bytes");
+    );
+    assert_eq!(reply.status, 200, "gzip sniffed from magic bytes");
 
     // declared gzip with a non-gzip body is rejected
     let plain = common::trace_request(vec![common::span([52u8; 16], [1u8; 8], "plain", t0)]);
-    let resp = post(
-        &client,
-        &base,
-        "/v1/traces",
-        Some(PB),
-        plain.encode_to_vec(),
-    )
-    .await;
-    assert_eq!(resp.status(), 200, "plain body still accepted");
-    let resp = client
-        .post(format!("{base}/v1/traces"))
-        .header(reqwest::header::CONTENT_TYPE, PB)
-        .header(reqwest::header::CONTENT_ENCODING, "gzip")
-        .body(vec![0x00, 0x01, 0x02])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 400, "declared gzip must decompress");
+    let reply = post(&agent, &base, "/v1/traces", Some(PB), plain.encode_to_vec());
+    assert_eq!(reply.status, 200, "plain body still accepted");
+    let reply = send(
+        agent
+            .post(&format!("{base}/v1/traces"))
+            .set("Content-Type", PB)
+            .set("Content-Encoding", "gzip"),
+        &[0x00, 0x01, 0x02],
+    );
+    assert_eq!(reply.status, 400, "declared gzip must decompress");
 
     // oversized body hits the 64MB limit: server either answers 413 or aborts
     // the connection mid-body; both are rejections
-    let oversized = client
-        .post(format!("{base}/v1/traces"))
-        .header(reqwest::header::CONTENT_TYPE, PB)
-        .body(vec![0u8; 65 * 1024 * 1024])
-        .send()
-        .await;
+    let oversized = agent
+        .post(&format!("{base}/v1/traces"))
+        .set("Content-Type", PB)
+        .send_bytes(&vec![0u8; 65 * 1024 * 1024]);
     match oversized {
         Ok(resp) => assert_eq!(resp.status(), 413),
-        Err(e) => assert!(e.is_connect() || e.is_body() || e.is_request()),
+        Err(ureq::Error::Status(code, _)) => assert_eq!(code, 413),
+        Err(_) => {} // server aborted the connection mid-body
     }
 
     // unsupported metric types answer 200 and store nothing
@@ -333,15 +325,14 @@ async fn protocol_edges() {
         ),
         ..Default::default()
     };
-    let resp = post(
-        &client,
+    let reply = post(
+        &agent,
         &base,
         "/v1/metrics",
         Some(PB),
         common::metrics_request(vec![hist]).encode_to_vec(),
-    )
-    .await;
-    assert_eq!(resp.status(), 200);
+    );
+    assert_eq!(reply.status, 200);
 
     // one request, two resources → two resource rows, both spans stored
     let mk_span = |trace: u8| common::span([trace; 16], [trace; 8], "multi", t0);
@@ -369,18 +360,18 @@ async fn protocol_edges() {
     let req = opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest {
         resource_spans: vec![rs_a, rs_b],
     };
-    let resp = post(&client, &base, "/v1/traces", Some(PB), req.encode_to_vec()).await;
-    assert_eq!(resp.status(), 200);
+    let reply = post(&agent, &base, "/v1/traces", Some(PB), req.encode_to_vec());
+    assert_eq!(reply.status, 200);
 
     // duplicate export of the same request: idempotent
     let dup = common::trace_request(vec![common::span([31u8; 16], [1u8; 8], "dup", t0)]);
     let dup_bytes = dup.encode_to_vec();
-    let resp = post(&client, &base, "/v1/traces", Some(PB), dup_bytes.clone()).await;
-    assert_eq!(resp.status(), 200);
-    let resp = post(&client, &base, "/v1/traces", Some(PB), dup_bytes).await;
-    assert_eq!(resp.status(), 200);
+    let reply = post(&agent, &base, "/v1/traces", Some(PB), dup_bytes.clone());
+    assert_eq!(reply.status, 200);
+    let reply = post(&agent, &base, "/v1/traces", Some(PB), dup_bytes);
+    assert_eq!(reply.status, 200);
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    std::thread::sleep(Duration::from_millis(1500));
     let status = common::terminate(&mut child);
     assert!(status.success());
 
@@ -395,8 +386,8 @@ async fn protocol_edges() {
     assert_eq!(common::cf_count(&db, "points"), 0, "histogram not stored");
 }
 
-#[tokio::test]
-async fn flushed_data_survives_a_sigkill() {
+#[test]
+fn flushed_data_survives_a_sigkill() {
     let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp");
     std::fs::create_dir_all(&repo_tmp).unwrap();
     let dir = tempfile::Builder::new()
@@ -406,18 +397,18 @@ async fn flushed_data_survives_a_sigkill() {
     let data_dir = dir.path().join("data");
     let (mut child, addr) = common::spawn_server(&data_dir, None);
     let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+    let agent = test_agent();
     let req = common::trace_request(vec![common::span(
         [41u8; 16],
         [1u8; 8],
         "survivor",
         common::now_ns(),
     )]);
-    let resp = post(&client, &base, "/v1/traces", Some(PB), req.encode_to_vec()).await;
-    assert_eq!(resp.status(), 200);
+    let reply = post(&agent, &base, "/v1/traces", Some(PB), req.encode_to_vec());
+    assert_eq!(reply.status, 200);
 
     // past the 1s flush interval: the batch is in rocksdb before the kill
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    std::thread::sleep(Duration::from_millis(1500));
     unsafe {
         libc::kill(child.id() as libc::c_int, libc::SIGKILL);
     }
@@ -428,8 +419,8 @@ async fn flushed_data_survives_a_sigkill() {
     assert_eq!(common::cf_count(&db, "spans_by_time"), 1);
 }
 
-#[tokio::test]
-async fn backpressure_429_when_the_queue_is_saturated() {
+#[test]
+fn backpressure_429_when_the_queue_is_saturated() {
     let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp");
     std::fs::create_dir_all(&repo_tmp).unwrap();
     let dir = tempfile::Builder::new()
@@ -446,10 +437,10 @@ async fn backpressure_429_when_the_queue_is_saturated() {
     .unwrap();
     let (mut child, addr) = common::spawn_server(&data_dir, Some(&cfg_path));
     let base = format!("http://{addr}");
-    let client = reqwest::Client::builder()
+    let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap();
+        .max_idle_connections_per_host(0)
+        .build();
 
     let mut accepted = 0;
     let mut rejected = 0;
@@ -460,10 +451,10 @@ async fn backpressure_429_when_the_queue_is_saturated() {
             "flood",
             common::now_ns(),
         )]);
-        let resp = post(&client, &base, "/v1/traces", Some(PB), req.encode_to_vec()).await;
-        match resp.status() {
-            reqwest::StatusCode::OK => accepted += 1,
-            reqwest::StatusCode::TOO_MANY_REQUESTS => rejected += 1,
+        let reply = post(&agent, &base, "/v1/traces", Some(PB), req.encode_to_vec());
+        match reply.status {
+            200 => accepted += 1,
+            429 => rejected += 1,
             other => panic!("unexpected status {other} on flood request {i}"),
         }
     }
@@ -476,26 +467,25 @@ async fn backpressure_429_when_the_queue_is_saturated() {
         vec![common::kv("env", "test")],
         common::now_ns(),
     )]);
-    let resp = post(
-        &client,
+    let reply = post(
+        &agent,
         &base,
         "/v1/metrics",
         Some(PB),
         metrics.encode_to_vec(),
-    )
-    .await;
-    assert_eq!(resp.status(), 200, "signals have independent queues");
+    );
+    assert_eq!(reply.status, 200, "signals have independent queues");
 
     // after the flush interval the queue drains and accepts again
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    std::thread::sleep(Duration::from_millis(2500));
     let req = common::trace_request(vec![common::span(
         [60u8; 16],
         [1u8; 8],
         "post-drain",
         common::now_ns(),
     )]);
-    let resp = post(&client, &base, "/v1/traces", Some(PB), req.encode_to_vec()).await;
-    assert_eq!(resp.status(), 200, "queue accepts again after draining");
+    let reply = post(&agent, &base, "/v1/traces", Some(PB), req.encode_to_vec());
+    assert_eq!(reply.status, 200, "queue accepts again after draining");
 
     let status = common::terminate(&mut child);
     assert!(status.success());

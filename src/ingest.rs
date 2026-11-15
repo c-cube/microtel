@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::keys;
 use crate::pipeline::Pipeline;
 use crate::proto::{
-    AttrSet, Data, ExportMetricsServiceRequest, ExportTraceServiceRequest, NumberDataPoint,
+    AttrSet, Data, ExportMetricsServiceRequest, ExportTraceServiceRequest, MetricKind,
     SpanEnvelope, hash16,
 };
 use crate::stats::{Endpoint, Stats};
@@ -155,9 +155,9 @@ async fn metrics_inner(app: &App, headers: &HeaderMap, body: Bytes) -> Response 
         for sm in rm.scope_metrics {
             for m in sm.metrics {
                 let name = m.name.clone();
-                let dps: Vec<NumberDataPoint> = match m.data {
-                    Some(Data::Gauge(g)) => g.data_points,
-                    Some(Data::Sum(s)) => s.data_points,
+                let (kind, dps) = match m.data {
+                    Some(Data::Gauge(g)) => (MetricKind::Gauge, g.data_points),
+                    Some(Data::Sum(s)) => (MetricKind::Sum, s.data_points),
                     _ => {
                         tracing::debug!(name = %name, "metric type not stored");
                         continue;
@@ -166,10 +166,15 @@ async fn metrics_inner(app: &App, headers: &HeaderMap, body: Bytes) -> Response 
                 seen += dps.len() as u64;
                 for dp in dps {
                     let value = dp.encode_to_vec();
+                    // Hash the attrs only, so stored series keys survive schema extensions.
+                    let attr_hash = hash16(&AttrSet {
+                        attributes: dp.attributes.clone(),
+                        kind: MetricKind::Unspecified as i32,
+                    });
                     let attr_set = AttrSet {
                         attributes: dp.attributes,
+                        kind: kind as i32,
                     };
-                    let attr_hash = hash16(&attr_set);
                     let ymd = keys::ymd(dp.time_unix_nano);
                     series_rows
                         .entry((name.clone(), attr_hash))

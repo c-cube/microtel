@@ -7,8 +7,8 @@ use microtel::keys;
 use prost::Message;
 
 /// ttl_days: 1 → cutoff = yesterday; spans older than yesterday are purged daily (here: every 1s).
-#[tokio::test]
-async fn purge_expired_by_ttl() {
+#[test]
+fn purge_expired_by_ttl() {
     let repo_tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp");
     std::fs::create_dir_all(&repo_tmp).unwrap();
     let dir = tempfile::Builder::new()
@@ -24,7 +24,17 @@ async fn purge_expired_by_ttl() {
     .unwrap();
     let (mut child, addr) = common::spawn_server(&data_dir, Some(&cfg_path));
     let base = format!("http://{addr}");
-    let client = reqwest::Client::new();
+
+    let post_trace = |req: Vec<u8>| -> u16 {
+        match ureq::post(&format!("{base}/v1/traces"))
+            .set("Content-Type", "application/x-protobuf")
+            .send_bytes(&req)
+        {
+            Ok(r) => r.status(),
+            Err(ureq::Error::Status(code, _)) => code,
+            Err(e) => panic!("transport error: {e}"),
+        }
+    };
 
     let now = common::now_ns();
     let three_days_ago = now - 3 * 86_400_000_000_000;
@@ -34,26 +44,12 @@ async fn purge_expired_by_ttl() {
         "stale",
         three_days_ago,
     )]);
-    let resp = client
-        .post(format!("{base}/v1/traces"))
-        .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
-        .body(req.encode_to_vec())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(post_trace(req.encode_to_vec()), 200);
     let req = common::trace_request(vec![common::span([8u8; 16], [1u8; 8], "fresh", now)]);
-    let resp = client
-        .post(format!("{base}/v1/traces"))
-        .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
-        .body(req.encode_to_vec())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(post_trace(req.encode_to_vec()), 200);
 
     // wait past a purge tick so the stale span (flushed within 1s) is removed
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    std::thread::sleep(Duration::from_millis(3000));
     let status = common::terminate(&mut child);
     assert!(
         status.success(),

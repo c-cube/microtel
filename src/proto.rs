@@ -35,4 +35,14 @@ pub struct SpanEnvelope {
 pub struct AttrSet {
     #[prost(message, repeated, tag = "1")]
     pub attributes: Vec<KeyValue>,
+    /// Metric aggregation type, rides in the value so the attrs-only hash stays stable.
+    #[prost(enumeration = "MetricKind", tag = "2")]
+    pub kind: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+pub enum MetricKind {
+    Unspecified = 0,
+    Gauge = 1,
+    Sum = 2,
 }

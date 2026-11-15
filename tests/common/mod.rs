@@ -275,6 +275,7 @@ pub fn series_row(name: &str, attr_hash: [u8; 16]) -> SeriesRow {
         attr_hash,
         value: microtel::proto::AttrSet {
             attributes: vec![kv("k", "v")],
+            kind: 0,
         }
         .encode_to_vec(),
     }

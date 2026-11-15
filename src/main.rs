@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use microtel::{config, ingest, pipeline, purge, stats, store};
+use microtel::{api, config, ingest, pipeline, purge, stats, store};
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -88,9 +88,12 @@ async fn tokio_run(cfg: config::Config) -> Result<(), Box<dyn std::error::Error>
     let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     tracing::info!("listening on {}", listener.local_addr()?);
     tracing::info!("storage: {}", cfg.storage_dir.display());
-    axum::serve(listener, ingest::router(app.clone()))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        ingest::router(app.clone()).merge(api::router(store.clone())),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     drop(app);
     trace_writer.await?;
     metric_writer.await?;
