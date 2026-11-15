@@ -70,11 +70,12 @@ metric selection and exemplar links pointing at real traces.
 `tools/ui-check.sh` starts a throwaway server on :19418, seeds it, and runs
 bombadil for N seconds each on `/spans`, `/metrics` and a real trace:
 
-    # grab the bombadil binary from its releases page, then:
+    pnpm --dir tools install   # once
     tools/ui-check.sh 60
 
-Set `BOMBADIL=` and `CHROME=` when they are not on `PATH` / in a standard
-location.
+The Bombadil spec package and CLI are tools dev dependencies. Set `BOMBADIL` or
+`CHROME` to override their defaults; set `OUT` to choose where unique run traces
+are saved (default: a timestamped directory under `.tmp/`).
 
 ## Docker
 

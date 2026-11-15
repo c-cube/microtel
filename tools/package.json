@@ -4,7 +4,10 @@
 	"type": "module",
 	"scripts": {
 		"lint": "biome check .",
-		"emit": "node emit.mjs"
+		"emit": "node emit.mjs",
+		"seed": "node seed.mjs",
+		"shot": "node shot.mjs",
+		"ui-check": "./ui-check.sh"
 	},
 	"dependencies": {
 		"@opentelemetry/api": "1.10.0",
@@ -15,6 +18,8 @@
 		"@opentelemetry/sdk-trace-base": "2.12.0"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "2.6.4"
+		"@antithesishq/bombadil": "0.7.10",
+		"@biomejs/biome": "2.6.4",
+		"playwright-core": "1.59.1"
 	}
 }
