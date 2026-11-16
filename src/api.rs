@@ -105,9 +105,10 @@ fn parse_groups(p: &HashMap<String, String>) -> Result<Vec<GroupDimension>, ()> 
     let mut groups = Vec::with_capacity(keys.len());
     for key in keys {
         let group = GroupDimension::parse(&key).ok_or(())?;
-        if !groups.contains(&group) {
-            groups.push(group);
+        if groups.contains(&group) {
+            continue;
         }
+        groups.push(group);
     }
     Ok(groups)
 }
