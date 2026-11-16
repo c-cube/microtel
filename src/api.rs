@@ -58,7 +58,7 @@ fn parse_range(p: &HashMap<String, String>) -> Result<(u64, u64), (StatusCode, &
     Ok((from, to))
 }
 
-fn svcs(p: &HashMap<String, String>) -> Vec<String> {
+fn parse_services(p: &HashMap<String, String>) -> Vec<String> {
     param(p, "svcs")
         .unwrap_or("")
         .split(',')
@@ -89,7 +89,7 @@ async fn barchart(
         from,
         to,
         by,
-        &svcs(&p),
+        &parse_services(&p),
         query::SCAN_CAP,
         buckets,
     ))
@@ -144,7 +144,7 @@ async fn points(
         name,
         from,
         to,
-        &svcs(&p),
+        &parse_services(&p),
         query::SCAN_CAP,
         buckets,
     ))
