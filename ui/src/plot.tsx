@@ -51,7 +51,7 @@ const escapeHtml = (value: string) =>
 
 // uPlot ships no stacked bars; paint cumulative rects per visible series after
 // the grid. Hidden series are skipped, so the stack reflows with the legend.
-function stackedBars(): uPlot.Plugin {
+function stackedBars(pinned: () => { time: number } | null): uPlot.Plugin {
   return {
     hooks: {
       draw: (u: uPlot) => {
@@ -60,13 +60,15 @@ function stackedBars(): uPlot.Plugin {
         if (!n) return;
         const px = (i: number) => u.valToPos(u.data[0][i], "x", true);
         const slot = n > 1 ? Math.abs(px(1) - px(0)) : u.bbox.width;
-        const w = Math.max(1, Math.min(48, slot * 0.8));
+        const w = Math.max(1, n > 1 ? slot + 1 : Math.min(48, slot));
 
         ctx.save();
         ctx.beginPath();
         ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
         ctx.clip();
-        const hovered = u.cursor.idx;
+        const pinnedTime = pinned()?.time;
+        const selected = pinnedTime == null ? -1 : u.data[0].indexOf(pinnedTime);
+        const hovered = selected >= 0 ? selected : u.cursor.idx;
         if (hovered != null && hovered < n) {
           ctx.fillStyle = "rgba(128,140,160,0.18)";
           ctx.fillRect(px(hovered) - slot / 2, u.bbox.top, slot, u.bbox.height);
@@ -103,7 +105,7 @@ export default function Plot(props: PlotProps) {
   let tip!: HTMLDivElement;
   let up: uPlot | undefined;
   const [hidden, setHidden] = createSignal<Record<string, boolean>>({});
-  const [pinned, setPinned] = createSignal<{ idx: number; label: string } | null>(null);
+  const [pinned, setPinned] = createSignal<{ label: string; time: number } | null>(null);
   // Defer hiding transient hover tips so the pointer can reach them. Bar
   // details are pinned separately and only close on Escape or an outside click.
   let overTip = false;
@@ -134,6 +136,7 @@ export default function Plot(props: PlotProps) {
     tip.classList.remove("preview");
     tip.setAttribute("role", "tooltip");
     tip.removeAttribute("aria-label");
+    up?.redraw();
   };
 
   const positionTip = (u: uPlot) => {
@@ -281,7 +284,7 @@ export default function Plot(props: PlotProps) {
         },
       ],
       plugins: [
-        ...(props.bars ? [stackedBars()] : []),
+        ...(props.bars ? [stackedBars(pinned)] : []),
         {
           hooks: {
             setCursor: (u) => {
@@ -361,9 +364,10 @@ export default function Plot(props: PlotProps) {
             html += `<div class="tip-dismiss">Esc or click outside to close</div>`;
             tip.innerHTML = html;
             tip.tabIndex = -1;
-            setPinned({ idx, label });
+            setPinned({ label, time: plot.data[0][idx] as number });
             showTip("pinned");
             positionTip(plot);
+            plot.redraw();
             tip.focus({ preventScroll: true });
             return;
           }
