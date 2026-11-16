@@ -101,28 +101,6 @@ export default function Spans() {
     return ex ? `/trace/${ex.trace_id}?at=${ex.t}` : undefined;
   };
 
-  const [copied, setCopied] = createSignal<{ text: string; href?: string }>({ text: "" });
-  let toastTimer: ReturnType<typeof setTimeout> | undefined;
-  createEffect(() => {
-    if (copied().text) {
-      clearTimeout(toastTimer);
-      toastTimer = setTimeout(() => setCopied({ text: "" }), 4000);
-    }
-  });
-
-  const pickExemplar = (idx: number, label: string) => {
-    const ex = findExemplar(idx, label);
-    if (ex) void navigator.clipboard.writeText(ex.trace_id);
-    setCopied(
-      ex
-        ? {
-            text: `${label} · ${ex.trace_id.slice(0, 12)}… copied`,
-            href: `/trace/${ex.trace_id}?at=${ex.t}`,
-          }
-        : { text: "no exemplar in that bucket" },
-    );
-  };
-
   const toggleSvc = (label: string) => {
     const cur = svcs();
     const next = cur.includes(label) ? cur.filter((l) => l !== label) : [...cur, label];
@@ -332,21 +310,9 @@ export default function Spans() {
             height={420}
             tipExemplar={exemplarText}
             tipLink={exemplarHref}
-            onPick={pickExemplar}
           />
         </Show>
       </section>
-
-      <Show when={copied().text}>
-        <div class="toast on">
-          {copied().text}
-          <Show when={copied().href}>
-            <a class="link" style={{ "margin-left": "10px", color: "#a5b4fc" }} href={copied().href}>
-              open trace →
-            </a>
-          </Show>
-        </div>
-      </Show>
     </div>
   );
 

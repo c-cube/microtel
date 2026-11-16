@@ -312,6 +312,27 @@ button, input, select { font-family: inherit; font-weight: inherit; }
 .tip .sw { width: 8px; height: 8px; flex: none; }
 .tip a { color: inherit; text-decoration: underline; }
 .tip .dim { opacity: 0.65; }
+.tip.preview {
+  opacity: 0.8;
+  pointer-events: none;
+  font-size: 11px;
+}
+.tip.pinned {
+  width: max-content;
+  min-width: 210px;
+  max-width: min(360px, calc(100vw - 24px));
+  padding: 9px 11px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line);
+  box-shadow: 0 8px 24px #0004;
+}
+.tip-time { color: var(--muted); }
+.tip-group { display: flex; align-items: center; gap: 7px; margin-top: 4px; }
+.tip-count { margin-top: 3px; font-variant-numeric: tabular-nums; }
+.tip-trace { margin-top: 8px; }
+.tip-trace a { display: inline-block; padding: 4px 0; }
+.tip-empty { margin-top: 8px; color: var(--muted); }
 
 .empty {
   margin: 10px;

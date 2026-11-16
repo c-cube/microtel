@@ -24,7 +24,6 @@ export interface PlotProps {
   fmt?: (v: number) => string;
   tipExemplar?: (idx: number, label: string) => string | undefined;
   tipLink?: (idx: number, label: string) => string | undefined;
-  onPick?: (idx: number, label: string) => void;
   sync?: string;
   inlineLegend?: boolean;
 }
@@ -38,6 +37,17 @@ const clock = (ms: number, spanMs: number) => {
       ? `${p(d.getHours())}:${p(d.getMinutes())}`
       : `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 };
+
+const escapeHtml = (value: string) =>
+  value.replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case "&": return "&amp;";
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case '"': return "&quot;";
+      default: return "&#39;";
+    }
+  });
 
 // uPlot ships no stacked bars; paint cumulative rects per visible series after
 // the grid. Hidden series are skipped, so the stack reflows with the legend.
@@ -93,20 +103,51 @@ export default function Plot(props: PlotProps) {
   let tip!: HTMLDivElement;
   let up: uPlot | undefined;
   const [hidden, setHidden] = createSignal<Record<string, boolean>>({});
-  // uPlot clears the cursor when the pointer leaves the canvas, which also
-  // happens when it moves onto the tooltip; hiding is deferred so the pointer
-  // has time to reach the tooltip and keep its links usable
+  const [pinned, setPinned] = createSignal<{ idx: number; label: string } | null>(null);
+  // Defer hiding transient hover tips so the pointer can reach them. Bar
+  // details are pinned separately and only close on Escape or an outside click.
   let overTip = false;
   let hideTimer = 0;
-  const showTip = () => {
+  const showTip = (kind: "preview" | "hover" | "pinned") => {
     clearTimeout(hideTimer);
+    tip.classList.toggle("preview", kind === "preview");
+    tip.classList.toggle("pinned", kind === "pinned");
+    if (kind === "pinned") {
+      tip.setAttribute("role", "dialog");
+      tip.setAttribute("aria-label", "Span bucket details");
+    } else {
+      tip.setAttribute("role", "tooltip");
+      tip.removeAttribute("aria-label");
+    }
     tip.style.display = "block";
   };
   const hideTipSoon = () => {
     clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
-      if (!overTip) tip.style.display = "none";
+      if (!pinned() && !overTip) tip.style.display = "none";
     }, 320);
+  };
+  const dismissPinned = () => {
+    setPinned(null);
+    tip.style.display = "none";
+    tip.classList.remove("pinned");
+    tip.classList.remove("preview");
+    tip.setAttribute("role", "tooltip");
+    tip.removeAttribute("aria-label");
+  };
+
+  const positionTip = (u: uPlot) => {
+    const left = u.cursor.left ?? 0;
+    const tipBox = tip.parentElement;
+    const gap = 12;
+    const flip = left > u.bbox.width - Math.min(300, tip.offsetWidth);
+    const maxLeft = Math.max(0, (tipBox?.clientWidth ?? box.clientWidth) - tip.offsetWidth);
+    const preferredLeft = flip ? left - tip.offsetWidth - gap : left + gap;
+    tip.style.left = `${Math.min(maxLeft, Math.max(0, preferredLeft))}px`;
+    tip.style.top = `${Math.min(
+      Math.max(0, (tipBox?.clientHeight ?? box.clientHeight) - tip.offsetHeight),
+      Math.max(0, (u.cursor.top ?? 0) - 12),
+    )}px`;
   };
 
   const fmt = (v: number) => (props.fmt ? props.fmt(v) : fmtCount(v));
@@ -156,6 +197,7 @@ export default function Plot(props: PlotProps) {
   };
 
   const build = () => {
+    dismissPinned();
     if (up) {
       up.destroy();
       up = undefined;
@@ -236,39 +278,40 @@ export default function Plot(props: PlotProps) {
         {
           hooks: {
             setCursor: (u) => {
+              if (pinned()) return;
               const idx = u.cursor.idx;
-              if (idx == null || !u.data[0]?.[idx]) {
+              if (idx == null || u.data[0]?.[idx] == null) {
                 hideTipSoon();
                 return;
               }
-              let html = `<div>${fmtWhen(u.data[0][idx])}</div>`;
-              for (let s = 1; s < u.series.length; s++) {
-                if (!u.series[s].show) continue;
-                const label = String(u.series[s].label ?? "");
-                const v = (u.data[s]?.[idx] as number | null) ?? null;
-                const term = props.bars ? " spans" : "";
-                const dot = color(paletteIdx.get(label) ?? 0);
-                html += `<div class="row"><span class="sw" style="background:${dot}"></span>${label} <span class="dim">·</span> ${
-                  v == null ? "–" : fmt(v) + term
-                }</div>`;
-                const ex = props.tipExemplar?.(idx, label);
-                if (ex) {
-                  const href = props.tipLink?.(idx, label);
-                  html += href
-                    ? `<div class="row"><a href="${href}">↳ ${ex}</a></div>`
-                    : `<div class="row"><span class="dim">↳ ${ex}</span></div>`;
+              const time = escapeHtml(fmtWhen(u.data[0][idx] as number));
+              if (props.bars) {
+                let total = 0;
+                for (let s = 1; s < u.series.length; s++) {
+                  if (u.series[s].show) total += (u.data[s]?.[idx] as number | null) ?? 0;
                 }
+                tip.innerHTML = `<div>${time}</div><div>${fmt(total)} spans</div>`;
+                showTip("preview");
+              } else {
+                let html = `<div>${time}</div>`;
+                for (let s = 1; s < u.series.length; s++) {
+                  if (!u.series[s].show) continue;
+                  const label = String(u.series[s].label ?? "");
+                  const v = (u.data[s]?.[idx] as number | null) ?? null;
+                  const dot = color(paletteIdx.get(label) ?? 0);
+                  html += `<div class="row"><span class="sw" style="background:${dot}"></span>${escapeHtml(label)} <span class="dim">·</span> ${v == null ? "–" : fmt(v)}</div>`;
+                  const ex = props.tipExemplar?.(idx, label);
+                  if (ex) {
+                    const href = props.tipLink?.(idx, label);
+                    html += href
+                      ? `<div class="row"><a href="${escapeHtml(href)}">↳ ${escapeHtml(ex)}</a></div>`
+                      : `<div class="row"><span class="dim">↳ ${escapeHtml(ex)}</span></div>`;
+                  }
+                }
+                tip.innerHTML = html;
+                showTip("hover");
               }
-              tip.innerHTML = html;
-              showTip();
-              const left = u.cursor.left ?? 0;
-              const flip = left > u.bbox.width - 300;
-              const gap = 24;
-              const tipBox = tip.parentElement;
-              const maxLeft = Math.max(0, (tipBox?.clientWidth ?? box.clientWidth) - tip.offsetWidth);
-              const preferredLeft = flip ? left - tip.offsetWidth - gap : left + gap;
-              tip.style.left = `${Math.min(maxLeft, Math.max(0, preferredLeft))}px`;
-              tip.style.top = `${Math.min(Math.max(0, (tipBox?.clientHeight ?? box.clientHeight) - tip.offsetHeight), Math.max(0, (u.cursor.top ?? 0) - 18))}px`;
+              positionTip(u);
             },
           },
         },
@@ -277,47 +320,84 @@ export default function Plot(props: PlotProps) {
 
     up = new uPlot(opts, [props.t, ...series.map((s) => s.values)], host);
 
-    // the tooltip carries the exemplar link, so it stays alive while the
-    // pointer is over the tooltip itself, even after leaving the canvas
-    tip.addEventListener("mouseenter", () => {
-      overTip = true;
-      clearTimeout(hideTimer);
-    });
-    tip.addEventListener("mouseleave", () => {
-      overTip = false;
-      hideTipSoon();
-    });
-    box.addEventListener("mouseleave", () => {
-      if (!overTip) hideTipSoon();
-    });
-
-    if (props.onPick && props.bars) {
+    if (props.bars) {
       up.over.addEventListener("click", () => {
-        const idx = up?.cursor.idx;
-        if (idx == null || !up) return;
-        const ypx = up.cursor.top ?? -1;
+        const plot = up;
+        const idx = plot?.cursor.idx;
+        if (idx == null || !plot) {
+          dismissPinned();
+          return;
+        }
+        const ypx = plot.cursor.top ?? -1;
         let below = 0;
-        for (let s = 1; s < up.series.length; s++) {
-          const ser = up.series[s];
-          const v = (up.data[s]?.[idx] as number | null) ?? 0;
+        for (let s = 1; s < plot.series.length; s++) {
+          const ser = plot.series[s];
+          const v = (plot.data[s]?.[idx] as number | null) ?? 0;
           if (!ser.show || v <= 0) {
             if (ser.show) below += v;
             continue;
           }
-          const yTop = up.valToPos(below + v, "y", true);
-          const yBot = up.valToPos(below, "y", true);
+          const yTop = plot.valToPos(below + v, "y", true);
+          const yBot = plot.valToPos(below, "y", true);
           if (ypx >= yTop && ypx <= yBot) {
-            props.onPick?.(idx, String(ser.label ?? ""));
+            const label = String(ser.label ?? "");
+            const value = (plot.data[s]?.[idx] as number | null) ?? null;
+            const dot = color(paletteIdx.get(label) ?? 0);
+            const ex = props.tipExemplar?.(idx, label);
+            const href = props.tipLink?.(idx, label);
+            let html = `<div class="tip-time">${escapeHtml(fmtWhen(plot.data[0][idx] as number))}</div>`;
+            html += `<div class="tip-group"><span class="sw" style="background:${dot}"></span>${escapeHtml(label)}</div>`;
+            html += `<div class="tip-count">${value == null ? "–" : fmt(value)} spans</div>`;
+            html += ex && href
+              ? `<div class="tip-trace"><a href="${escapeHtml(href)}">↳ ${escapeHtml(ex)} · open trace</a></div>`
+              : `<div class="tip-empty">no trace exemplar in this bucket</div>`;
+            tip.innerHTML = html;
+            tip.tabIndex = -1;
+            setPinned({ idx, label });
+            showTip("pinned");
+            positionTip(plot);
+            tip.focus({ preventScroll: true });
             return;
           }
           below += v;
         }
+        dismissPinned();
       });
     }
   };
 
   onMount(() => {
     build();
+    const onTipEnter = () => {
+      overTip = true;
+      clearTimeout(hideTimer);
+    };
+    const onTipLeave = () => {
+      overTip = false;
+      hideTipSoon();
+    };
+    const onBoxLeave = () => {
+      if (!overTip) hideTipSoon();
+    };
+    const onOutsidePointerDown = (event: PointerEvent) => {
+      if (!pinned()) return;
+      const target = event.target;
+      if (
+        target instanceof Node &&
+        (tip.contains(target) || (up?.over.contains(target) ?? false))
+      ) return;
+      dismissPinned();
+    };
+    const onEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && pinned()) dismissPinned();
+    };
+
+    tip.addEventListener("mouseenter", onTipEnter);
+    tip.addEventListener("mouseleave", onTipLeave);
+    box.addEventListener("mouseleave", onBoxLeave);
+    document.addEventListener("pointerdown", onOutsidePointerDown, true);
+    window.addEventListener("keydown", onEscape);
+
     const ro = new ResizeObserver(() => {
       const w = host.clientWidth;
       if (up && w > 0) up.setSize({ width: w, height: props.height ?? 380 });
@@ -325,6 +405,12 @@ export default function Plot(props: PlotProps) {
     ro.observe(host);
     onCleanup(() => {
       ro.disconnect();
+      tip.removeEventListener("mouseenter", onTipEnter);
+      tip.removeEventListener("mouseleave", onTipLeave);
+      box.removeEventListener("mouseleave", onBoxLeave);
+      document.removeEventListener("pointerdown", onOutsidePointerDown, true);
+      window.removeEventListener("keydown", onEscape);
+      clearTimeout(hideTimer);
       up?.destroy();
     });
   });
