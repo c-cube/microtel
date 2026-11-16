@@ -149,6 +149,14 @@ export default function Plot(props: PlotProps) {
       Math.max(0, (u.cursor.top ?? 0) - 12),
     )}px`;
   };
+  const clampTip = () => {
+    const tipBox = tip.parentElement;
+    if (!tipBox) return;
+    const left = Number.parseFloat(tip.style.left) || 0;
+    const top = Number.parseFloat(tip.style.top) || 0;
+    tip.style.left = `${Math.min(left, Math.max(0, tipBox.clientWidth - tip.offsetWidth))}px`;
+    tip.style.top = `${Math.min(top, Math.max(0, tipBox.clientHeight - tip.offsetHeight))}px`;
+  };
 
   const fmt = (v: number) => (props.fmt ? props.fmt(v) : fmtCount(v));
   const color = (i: number) => palette()[i % palette().length];
@@ -197,7 +205,6 @@ export default function Plot(props: PlotProps) {
   };
 
   const build = () => {
-    dismissPinned();
     if (up) {
       up.destroy();
       up = undefined;
@@ -351,6 +358,7 @@ export default function Plot(props: PlotProps) {
             html += ex && href
               ? `<div class="tip-trace"><a href="${escapeHtml(href)}">↳ ${escapeHtml(ex)} · open trace</a></div>`
               : `<div class="tip-empty">no trace exemplar in this bucket</div>`;
+            html += `<div class="tip-dismiss">Esc or click outside to close</div>`;
             tip.innerHTML = html;
             tip.tabIndex = -1;
             setPinned({ idx, label });
@@ -401,6 +409,7 @@ export default function Plot(props: PlotProps) {
     const ro = new ResizeObserver(() => {
       const w = host.clientWidth;
       if (up && w > 0) up.setSize({ width: w, height: props.height ?? 380 });
+      if (pinned()) clampTip();
     });
     ro.observe(host);
     onCleanup(() => {
