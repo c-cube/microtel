@@ -12,7 +12,7 @@ That's it. It seems to be fine for me and runs in a few dozen MBs of memory.
 
 ## Scope
 
-Truly this is for my 5$ VPS and for local development. Feel to fork (MIT licensed) and do whatever but the scope is intentionally very small, and this will mostly evolve to serve my specific needs.
+Truly this is for my 5$ VPS and for local development. Feel free to fork (MIT licensed) and do whatever, but the scope is intentionally very small, and this will mostly evolve to serve my specific needs.
 
 ## web UI
 
