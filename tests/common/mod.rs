@@ -177,6 +177,8 @@ pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String) {
 }
 
 pub fn terminate(child: &mut Child) -> std::process::ExitStatus {
+    // libc::kill is FFI; std only offers SIGKILL (Child::kill).
+    #[allow(unsafe_code)]
     unsafe {
         libc::kill(child.id() as libc::c_int, libc::SIGTERM);
     }

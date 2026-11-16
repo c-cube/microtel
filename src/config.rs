@@ -43,22 +43,21 @@ impl Default for Queue {
     }
 }
 
-type Err = Box<dyn std::error::Error>;
-
 pub fn load(
     config_path: Option<PathBuf>,
     listen: Option<String>,
     storage_dir: Option<PathBuf>,
     ttl_days: Option<u32>,
-) -> Result<Config, Err> {
+) -> anyhow::Result<Config> {
     let explicit = config_path.is_some();
     let path = config_path.unwrap_or_else(|| PathBuf::from("microtel.yaml"));
     let mut cfg = if path.exists() {
         let raw = std::fs::read_to_string(&path)?;
-        serde_norway::from_str::<Config>(&raw).map_err(|e| format!("{}: {e}", path.display()))?
+        serde_norway::from_str::<Config>(&raw)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?
     } else {
         if explicit {
-            return Err(format!("config file not found: {}", path.display()).into());
+            anyhow::bail!("config file not found: {}", path.display());
         }
         Config::default()
     };

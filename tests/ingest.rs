@@ -409,10 +409,7 @@ fn flushed_data_survives_a_sigkill() {
 
     // past the 1s flush interval: the batch is in rocksdb before the kill
     std::thread::sleep(Duration::from_millis(1500));
-    unsafe {
-        libc::kill(child.id() as libc::c_int, libc::SIGKILL);
-    }
-    child.wait().unwrap();
+    child.kill().unwrap();
 
     let db = common::open_read_only(&data_dir);
     assert_eq!(common::cf_count(&db, "spans_by_trace"), 1);

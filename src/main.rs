@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use microtel::{api, config, ingest, logging, pipeline, purge, stats, store};
 
@@ -38,7 +39,7 @@ enum Cmd {
     },
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(Cmd::Healthcheck { addr }) = cli.cmd {
         std::process::exit(healthcheck(&addr));
@@ -48,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Runtime::new()?.block_on(tokio_run(cfg))
 }
 
-async fn tokio_run(cfg: config::Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn tokio_run(cfg: config::Config) -> Result<()> {
     let store = Arc::new(store::Store::open(&cfg.storage_dir)?);
     let stats = Arc::new(stats::Stats::new());
     let (traces, trace_rx) =
