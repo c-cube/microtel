@@ -27,3 +27,9 @@ export function svcsList(raw: unknown): string[] {
     ? raw.split(",").filter(Boolean)
     : [];
 }
+
+export function stringList(raw: unknown): string[] {
+  return typeof raw === "string" && raw.length > 0
+    ? raw.split(",").filter(Boolean)
+    : [];
+}

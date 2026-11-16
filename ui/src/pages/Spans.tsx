@@ -169,13 +169,14 @@ export default function Spans() {
             )}
           </For>
         </div>
-        <span class="lbl">group</span>
         <select
           class="ctl"
-          value={group()}
+          value=""
+          aria-label="Add group by"
           onChange={(e) => setParams({ group: e.currentTarget.value }, { replace: true })}
         >
-          <For each={GROUPS}>{(g) => <option value={g}>{g}</option>}</For>
+          <option value="" disabled>add group by…</option>
+          <For each={GROUPS.filter((g) => g !== "none")}>{(g) => <option value={g}>{g}</option>}</For>
         </select>
         <select
           class="ctl"
@@ -187,6 +188,15 @@ export default function Spans() {
         <Show when={chart()?.truncated}>
           <span class="badge warn">capped at 50k spans</span>
         </Show>
+      </div>
+
+      <div class="chips" aria-label="Active span query">
+        <Show when={group() !== "none"}>
+          <span class="chip"><span class="chip-kind">group</span>{group()}<button class="chip-x" aria-label="Remove group by" onClick={() => setParams({ group: "none" }, { replace: true })}>×</button></span>
+        </Show>
+        <For each={svcs()}>
+          {(svc) => <span class="chip"><span class="chip-kind">service</span>{svc}<button class="chip-x" aria-label={`Remove ${svc} service filter`} onClick={() => toggleSvc(svc)}>×</button></span>}
+        </For>
       </div>
 
       <section class="card" ref={cardEl}>

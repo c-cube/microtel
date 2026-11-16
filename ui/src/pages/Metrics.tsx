@@ -1,7 +1,7 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup } from "solid-js";
 import { useSearchParams } from "@solidjs/router";
 import Plot from "../plot";
-import { PRESETS, REFRESH, DEFAULT_RANGE_MS, TO_PAD_MS, svcsList } from "../params";
+import { PRESETS, REFRESH, DEFAULT_RANGE_MS, TO_PAD_MS, svcsList, stringList } from "../params";
 import { fmtCount, points, series as fetchSeries } from "../api";
 
 const fmtBytes = (v: number) => {
@@ -56,20 +56,28 @@ export default function Metrics() {
   const fromMs = () => Number(params.from ?? Date.now() - DEFAULT_RANGE_MS);
   const toMs = () => Number(params.to ?? Date.now() + TO_PAD_MS);
   const svcs = () => svcsList(params.svcs);
+  const selectedNames = () => stringList(params.names);
   const rf = () => Number(params.rf ?? 60_000);
 
   const [allSeries] = createResource(fetchSeries);
-  const names = () => [...new Set((allSeries() ?? []).map((s) => s.name))].sort();
+  const allNames = () => [...new Set((allSeries() ?? []).map((s) => s.name))].sort();
+  const names = () => selectedNames().length
+    ? allNames().filter((name) => selectedNames().includes(name))
+    : allNames();
+  const services = () => [...new Set((allSeries() ?? []).map((s) => s.attrs["service.name"]).filter((s): s is string => Boolean(s)))].sort();
 
   createEffect(() => {
     if (!params.from || !params.to) setParams({ from: fromMs(), to: toMs(), rf: rf() }, { replace: true });
   });
 
-  return <MetricsBody names={names()} fromMs={fromMs()} toMs={toMs()} svcs={svcs()} rf={rf()} setParams={setParams} />;
+  return <MetricsBody names={names()} allNames={allNames()} services={services()} selectedNames={selectedNames()} fromMs={fromMs()} toMs={toMs()} svcs={svcs()} rf={rf()} setParams={setParams} />;
 }
 
 function MetricsBody(props: {
   names: string[];
+  allNames: string[];
+  services: string[];
+  selectedNames: string[];
   fromMs: number;
   toMs: number;
   svcs: string[];
@@ -91,6 +99,20 @@ function MetricsBody(props: {
   const activePreset = () => PRESETS.find(([, ms]) => Math.abs(span() - TO_PAD_MS - ms) < 2000 || Math.abs(span() - ms) < 2000)?.[0];
   const setRange = (ms: number) =>
     props.setParams({ from: Date.now() - ms, to: Date.now() + TO_PAD_MS }, { replace: true });
+  const addName = (name: string) => {
+    if (name) props.setParams({ names: [...new Set([...props.selectedNames, name])].join(",") }, { replace: true });
+  };
+  const removeName = (name: string) => {
+    const next = props.selectedNames.filter((item) => item !== name);
+    props.setParams({ names: next.length ? next.join(",") : undefined }, { replace: true });
+  };
+  const addService = (service: string) => {
+    if (service) props.setParams({ svcs: [...new Set([...props.svcs, service])].join(",") }, { replace: true });
+  };
+  const removeService = (service: string) => {
+    const next = props.svcs.filter((item) => item !== service);
+    props.setParams({ svcs: next.length ? next.join(",") : undefined }, { replace: true });
+  };
 
   return (
     <div>
@@ -112,8 +134,20 @@ function MetricsBody(props: {
           <For each={REFRESH}>{(r) => <option value={r[1]}>refresh {r[0]}</option>}</For>
         </select>
         <span class="lbl">{props.names.length} metrics</span>
+        <select class="ctl" value="" aria-label="Add metric filter" onChange={(e) => { addName(e.currentTarget.value); e.currentTarget.value = ""; }}>
+          <option value="" disabled>filter metric…</option>
+          <For each={props.allNames.filter((n) => !props.selectedNames.includes(n))}>{(n) => <option value={n}>{n}</option>}</For>
+        </select>
+        <select class="ctl" value="" aria-label="Add service filter" onChange={(e) => { addService(e.currentTarget.value); e.currentTarget.value = ""; }}>
+          <option value="" disabled>filter service…</option>
+          <For each={props.services.filter((s) => !props.svcs.includes(s))}>{(s) => <option value={s}>{s}</option>}</For>
+        </select>
       </div>
-      <Show when={props.names.length > 0} fallback={<div class="empty">no metrics ingested yet</div>}>
+      <div class="chips" aria-label="Active metric filters">
+        <For each={props.selectedNames}>{(name) => <span class="chip"><span class="chip-kind">metric</span>{name}<button class="chip-x" aria-label={`Remove ${name} metric filter`} onClick={() => removeName(name)}>×</button></span>}</For>
+        <For each={props.svcs}>{(svc) => <span class="chip"><span class="chip-kind">service</span>{svc}<button class="chip-x" aria-label={`Remove ${svc} service filter`} onClick={() => removeService(svc)}>×</button></span>}</For>
+      </div>
+      <Show when={props.names.length > 0} fallback={<div class="empty">{props.allNames.length ? "no metrics match these filters" : "no metrics ingested yet"}</div>}>
         <div class="mgrid">
           <For each={props.names}>
             {(n) => <MetricCard name={n} from={props.fromMs} to={props.toMs} svcs={props.svcs} tick={tick()} />}

@@ -263,8 +263,12 @@ export default function Plot(props: PlotProps) {
               showTip();
               const left = u.cursor.left ?? 0;
               const flip = left > u.bbox.width - 300;
-              tip.style.left = `${Math.max(0, flip ? left - tip.offsetWidth - 16 : left + 16)}px`;
-              tip.style.top = `${Math.max(0, (u.cursor.top ?? 0) - 12)}px`;
+              const gap = 24;
+              const tipBox = tip.parentElement;
+              const maxLeft = Math.max(0, (tipBox?.clientWidth ?? box.clientWidth) - tip.offsetWidth);
+              const preferredLeft = flip ? left - tip.offsetWidth - gap : left + gap;
+              tip.style.left = `${Math.min(maxLeft, Math.max(0, preferredLeft))}px`;
+              tip.style.top = `${Math.min(Math.max(0, (tipBox?.clientHeight ?? box.clientHeight) - tip.offsetHeight), Math.max(0, (u.cursor.top ?? 0) - 18))}px`;
             },
           },
         },

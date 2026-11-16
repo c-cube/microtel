@@ -209,6 +209,35 @@ button, input, select { font-family: inherit; font-weight: inherit; }
 }
 .badge.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
 
+.chips { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin: -3px 0 10px; }
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 23px;
+  padding: 1px 3px 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+  color: var(--ink-2);
+  font-size: 11px;
+  max-width: 100%;
+}
+.chip-kind { color: var(--muted); }
+.chip-x {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.chip-x:hover { color: var(--danger); }
+
 /* --- panels --- */
 
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 2px; }
