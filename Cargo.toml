@@ -20,6 +20,7 @@ opentelemetry-proto = { version = "0.33.1", default-features = false, features =
 prost = "0.14.6"
 rocksdb = "0.23.0"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1"
 serde_norway = "0.9.42"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
@@ -27,7 +28,6 @@ log = "0.4"
 
 [dev-dependencies]
 flate2 = "1.1.11"
-serde_json = "1"
 libc = "0.2.191"
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
 prost = "0.14.6"

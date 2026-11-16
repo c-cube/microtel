@@ -23,13 +23,26 @@ export const DEFAULT_RANGE_MS = 3_600_000;
 export const TO_PAD_MS = 60_000;
 
 export function svcsList(raw: unknown): string[] {
-  return typeof raw === "string" && raw.length > 0
-    ? raw.split(",").filter(Boolean)
-    : [];
+  return stringList(raw);
 }
 
 export function stringList(raw: unknown): string[] {
-  return typeof raw === "string" && raw.length > 0
-    ? raw.split(",").filter(Boolean)
-    : [];
+  if (typeof raw !== "string" || !raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (Array.isArray(parsed) && parsed.every((v) => typeof v === "string")) return parsed;
+  } catch {
+    // Older URLs used comma-separated lists.
+  }
+  return raw.split(",").filter(Boolean);
+}
+
+export function jsonStringList(raw: unknown, fallback: string[] = []): string[] {
+  if (typeof raw !== "string") return fallback;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.every((v) => typeof v === "string") ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
 }

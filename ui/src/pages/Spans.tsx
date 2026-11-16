@@ -1,20 +1,31 @@
 import { For, Show, createEffect, createMemo, createResource, createSignal, on, onCleanup, onMount } from "solid-js";
 import { useSearchParams } from "@solidjs/router";
 import Plot, { palette } from "../plot";
-import { PRESETS, REFRESH, DEFAULT_RANGE_MS, TO_PAD_MS, svcsList } from "../params";
-import { barchart, fmtCount, type GroupBy } from "../api";
+import { PRESETS, REFRESH, DEFAULT_RANGE_MS, TO_PAD_MS, svcsList, stringList, jsonStringList } from "../params";
+import { barchart, fmtCount, spanOptions, type GroupDimension } from "../api";
 
-const GROUPS: GroupBy[] = ["service", "name", "none"];
+const BUILTIN_GROUPS: GroupDimension[] = ["service", "name", "status"];
+const validGroup = (s: string): s is GroupDimension => {
+  if (BUILTIN_GROUPS.includes(s as GroupDimension)) return true;
+  const key = s.startsWith("span:") ? s.slice(5) : s.startsWith("resource:") ? s.slice(9) : "";
+  return key.length > 0 && key.length <= 256;
+};
 
 export default function Spans() {
   const [params, setParams] = useSearchParams();
 
   const fromMs = () => Number(params.from ?? Date.now() - DEFAULT_RANGE_MS);
   const toMs = () => Number(params.to ?? Date.now() + TO_PAD_MS);
-  const group = (): GroupBy =>
-    GROUPS.includes(params.group as GroupBy) ? (params.group as GroupBy) : "service";
+  const groups = (): GroupDimension[] => {
+    const legacyParam = typeof params.group === "string" ? params.group : undefined;
+    const legacy = legacyParam === "none" ? [] : [legacyParam || "service"];
+    return [...new Set(jsonStringList(params.groups, legacy).filter(validGroup))].slice(0, 8);
+  };
   const svcs = () => svcsList(params.svcs);
+  const spanNames = () => stringList(params.snames);
   const rf = () => Number(params.rf ?? 60_000);
+  const optionsQuery = createMemo(() => new URLSearchParams({ from: String(fromMs()), to: String(toMs()) }).toString());
+  const [options] = createResource(optionsQuery, (q) => spanOptions(q));
 
   // each bar slot gets at least MIN_SLOT_PX so it stays comfortably clickable;
   // the server snaps to the finest step that fits this many buckets
@@ -49,11 +60,13 @@ export default function Spans() {
     const q = new URLSearchParams({
       from: String(fromMs()),
       to: String(toMs()),
-      group_by: group(),
+      groups: JSON.stringify(groups()),
       buckets: String(want()),
     });
     const s = svcs();
-    if (s.length) q.set("svcs", s.join(","));
+    if (s.length) q.set("svcs", JSON.stringify(s));
+    const n = spanNames();
+    if (n.length) q.set("snames", JSON.stringify(n));
     return q.toString();
   });
   const [chart, { refetch }] = createResource(query, (q) => barchart(q));
@@ -113,8 +126,32 @@ export default function Spans() {
   const toggleSvc = (label: string) => {
     const cur = svcs();
     const next = cur.includes(label) ? cur.filter((l) => l !== label) : [...cur, label];
-    setParams({ svcs: next.length ? next.join(",") : undefined }, { replace: true });
+    setParams({ svcs: next.length ? JSON.stringify(next) : undefined }, { replace: true });
   };
+  const addService = (service: string) => {
+    if (service && !svcs().includes(service)) setParams({ svcs: JSON.stringify([...svcs(), service]) }, { replace: true });
+  };
+  const removeService = (service: string) => {
+    const next = svcs().filter((s) => s !== service);
+    setParams({ svcs: next.length ? JSON.stringify(next) : undefined }, { replace: true });
+  };
+  const addSpanName = (name: string) => {
+    if (name && !spanNames().includes(name)) setParams({ snames: JSON.stringify([...spanNames(), name]) }, { replace: true });
+  };
+  const removeSpanName = (name: string) => {
+    const next = spanNames().filter((s) => s !== name);
+    setParams({ snames: next.length ? JSON.stringify(next) : undefined }, { replace: true });
+  };
+  const setGroups = (next: GroupDimension[]) =>
+    setParams({ groups: JSON.stringify(next), group: undefined }, { replace: true });
+  const groupLabel = (g: GroupDimension) => {
+    if (g === "service") return "service";
+    if (g === "name") return "span name";
+    if (g === "status") return "status";
+    const [scope, key] = g.split(":", 2);
+    return `${scope} · ${key}`;
+  };
+  const serviceOnly = () => groups().length === 1 && groups()[0] === "service";
 
   const plotSeries = () => {
     const c = chart();
@@ -127,7 +164,7 @@ export default function Spans() {
 
   const totals = createMemo(() => {
     const c = chart();
-    if (!c) return { sum: 0, peak: 0, services: 0 };
+    if (!c) return { sum: 0, peak: 0, groups: 0 };
     let sum = 0;
     let peak = 0;
     for (let i = 0; i < (c.buckets[0]?.length ?? 0); i++) {
@@ -139,7 +176,7 @@ export default function Spans() {
     return {
       sum,
       peak,
-      services: c.labels.filter((l) => l !== "other").length,
+      groups: c.labels.filter((l) => l !== "other").length,
     };
   });
 
@@ -169,14 +206,39 @@ export default function Spans() {
             )}
           </For>
         </div>
-        <select
-          class="ctl"
-          value=""
-          aria-label="Add group by"
-          onChange={(e) => setParams({ group: e.currentTarget.value }, { replace: true })}
-        >
+        <select class="ctl" value="" aria-label="Add group by" onChange={(e) => {
+          const value = e.currentTarget.value;
+          if (value && groups().length < 8 && validGroup(value) && !groups().includes(value)) setGroups([...groups(), value]);
+          e.currentTarget.value = "";
+        }}>
           <option value="" disabled>add group by…</option>
-          <For each={GROUPS.filter((g) => g !== "none")}>{(g) => <option value={g}>{g}</option>}</For>
+          <optgroup label="Built in">
+            <For each={BUILTIN_GROUPS.filter((g) => !groups().includes(g))}>{(g) => <option value={g}>{groupLabel(g)}</option>}</For>
+          </optgroup>
+          <optgroup label="Span attributes">
+            <For each={(options()?.span_attributes ?? []).map((key) => `span:${key}` as GroupDimension).filter((g) => !groups().includes(g))}>
+              {(g) => <option value={g}>{groupLabel(g)}</option>}
+            </For>
+          </optgroup>
+          <optgroup label="Resource attributes">
+            <For each={(options()?.resource_attributes ?? []).map((key) => `resource:${key}` as GroupDimension).filter((g) => !groups().includes(g))}>
+              {(g) => <option value={g}>{groupLabel(g)}</option>}
+            </For>
+          </optgroup>
+        </select>
+        <select class="ctl" value="" aria-label="Filter services" onChange={(e) => {
+          addService(e.currentTarget.value);
+          e.currentTarget.value = "";
+        }}>
+          <option value="" disabled>filter service…</option>
+          <For each={(options()?.services ?? []).filter((s) => !svcs().includes(s))}>{(s) => <option value={s}>{s}</option>}</For>
+        </select>
+        <select class="ctl" value="" aria-label="Filter span names" onChange={(e) => {
+          addSpanName(e.currentTarget.value);
+          e.currentTarget.value = "";
+        }}>
+          <option value="" disabled>filter span name…</option>
+          <For each={(options()?.names ?? []).filter((s) => !spanNames().includes(s))}>{(s) => <option value={s}>{s}</option>}</For>
         </select>
         <select
           class="ctl"
@@ -191,11 +253,14 @@ export default function Spans() {
       </div>
 
       <div class="chips" aria-label="Active span query">
-        <Show when={group() !== "none"}>
-          <span class="chip"><span class="chip-kind">group</span>{group()}<button class="chip-x" aria-label="Remove group by" onClick={() => setParams({ group: "none" }, { replace: true })}>×</button></span>
-        </Show>
+        <For each={groups()}>
+          {(g) => <span class="chip"><span class="chip-kind">group</span>{groupLabel(g)}<button class="chip-x" aria-label={`Remove ${groupLabel(g)} grouping`} onClick={() => setGroups(groups().filter((item) => item !== g))}>×</button></span>}
+        </For>
         <For each={svcs()}>
-          {(svc) => <span class="chip"><span class="chip-kind">service</span>{svc}<button class="chip-x" aria-label={`Remove ${svc} service filter`} onClick={() => toggleSvc(svc)}>×</button></span>}
+          {(svc) => <span class="chip"><span class="chip-kind">service</span>{svc}<button class="chip-x" aria-label={`Remove ${svc} service filter`} onClick={() => removeService(svc)}>×</button></span>}
+        </For>
+        <For each={spanNames()}>
+          {(name) => <span class="chip"><span class="chip-kind">span</span>{name}<button class="chip-x" aria-label={`Remove ${name} span filter`} onClick={() => removeSpanName(name)}>×</button></span>}
         </For>
       </div>
 
@@ -204,6 +269,7 @@ export default function Spans() {
           <span class="card-title">Spans over time</span>
           <span class="card-sub">
             {bucketLabel()} buckets
+            {groups().length ? ` · grouped by ${groups().length} field${groups().length === 1 ? "" : "s"}` : ""}
             {svcs().length ? ` · ${svcs().length} service filter${svcs().length > 1 ? "s" : ""}` : ""}
           </span>
           <div class="stats">
@@ -216,20 +282,21 @@ export default function Spans() {
               <span>peak / bucket</span>
             </div>
             <div class="stat">
-              <b>{totals().services}</b>
-              <span>services</span>
+              <b>{totals().groups}</b>
+              <span>groups</span>
             </div>
           </div>
         </div>
 
-        <Show when={chart() && chart()!.labels.length > 0 && group() !== "none"}>
+        <Show when={chart() && chart()!.labels.length > 0 && groups().length > 0}>
           <div class="legend">
             <For each={chart()!.labels.filter((l) => l !== "other")}>
               {(label) => (
                 <button
-                  class={`lrow ${svcs().includes(label) ? "on" : ""}`}
-                  onClick={() => toggleSvc(label)}
-                  title="filter by service"
+                  class={`lrow ${serviceOnly() && svcs().includes(label) ? "on" : ""}`}
+                  disabled={!serviceOnly()}
+                  onClick={() => serviceOnly() && toggleSvc(label)}
+                  title={serviceOnly() ? "filter by service" : "service filtering is available above"}
                 >
                   <span class="sw" style={{ background: colorOf(label) }} />
                   <span class="nm">{label}</span>
@@ -238,7 +305,7 @@ export default function Spans() {
                 </button>
               )}
             </For>
-            <Show when={svcs().length > 0}>
+            <Show when={serviceOnly() && svcs().length > 0}>
               <button class="lrow" onClick={() => setParams({ svcs: undefined }, { replace: true })}>
                 <span />
                 <span class="nm">clear filter</span>

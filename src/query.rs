@@ -3,7 +3,7 @@
 //! Aggregation happens at query time over the stored indexes; every scan is
 //! bounded by a span/point cap and reports `truncated` when the cap bites.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use opentelemetry_proto::tonic::common::v1::any_value;
@@ -64,6 +64,46 @@ impl GroupBy {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupDimension {
+    Service,
+    Name,
+    Status,
+    SpanAttr(String),
+    ResourceAttr(String),
+}
+
+impl GroupDimension {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "service" => Some(Self::Service),
+            "name" => Some(Self::Name),
+            "status" => Some(Self::Status),
+            _ => {
+                let (kind, key) = s.split_once(':')?;
+                if key.is_empty() || key.len() > 256 {
+                    return None;
+                }
+                match kind {
+                    "span" => Some(Self::SpanAttr(key.to_string())),
+                    "resource" => Some(Self::ResourceAttr(key.to_string())),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn label_key(&self) -> String {
+        match self {
+            Self::Service => "service.name".into(),
+            Self::Name => "span.name".into(),
+            Self::Status => "status".into(),
+            Self::SpanAttr(key) => format!("span.{key}"),
+            Self::ResourceAttr(key) => format!("resource.{key}"),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct Exemplar {
     pub t: u64,
@@ -81,6 +121,14 @@ pub struct Barchart {
     pub labels: Vec<String>,
     pub buckets: Vec<Vec<u64>>,
     pub exemplars: Vec<Exemplar>,
+}
+
+#[derive(Serialize)]
+pub struct SpanOptions {
+    pub services: Vec<String>,
+    pub names: Vec<String>,
+    pub span_attributes: Vec<String>,
+    pub resource_attributes: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -263,6 +311,97 @@ fn service_of(store: &Store, resource_hash: &[u8]) -> Option<String> {
         })
 }
 
+fn load_resource_attrs(store: &Store, resource_hash: &[u8]) -> BTreeMap<String, String> {
+    store
+        .get(CF_RESOURCES, resource_hash)
+        .ok()
+        .flatten()
+        .and_then(|raw| crate::proto::Resource::decode(raw.as_slice()).ok())
+        .map(|resource| attr_map(&resource.attributes))
+        .unwrap_or_default()
+}
+
+pub fn span_options(store: &Store, from_ms: u64, to_ms: u64, cap: usize) -> SpanOptions {
+    let from_ns = from_ms * 1_000_000;
+    let to_ns = to_ms * 1_000_000;
+    let first_ymd = keys::ymd(from_ns);
+    let last_ymd = keys::ymd(to_ns.saturating_sub(1));
+    let seek = keys::span_time_key(first_ymd, from_ns, &[]);
+    let mut services = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let mut span_attributes = BTreeSet::new();
+    let mut resource_attributes = BTreeSet::new();
+    let mut resource_memo: HashMap<[u8; HASH_LEN], BTreeMap<String, String>> = HashMap::new();
+    let mut scanned = 0;
+
+    'outer: for (key, value) in store.scan_from(CF_SPAN_TIME, &seek) {
+        if key.len() != 28 {
+            continue;
+        }
+        let ymd = u32::from_be_bytes(key[0..4].try_into().expect("4 bytes"));
+        let start_ns = u64::from_be_bytes(key[4..12].try_into().expect("8 bytes"));
+        if ymd > last_ymd || (ymd == last_ymd && start_ns >= to_ns) {
+            break;
+        }
+        if start_ns < from_ns {
+            continue;
+        }
+        let Some(ids) = keys::parse_span_ids(&value) else {
+            continue;
+        };
+        for span_id in ids {
+            if scanned >= cap {
+                break 'outer;
+            }
+            scanned += 1;
+            let Some(env) = store
+                .get(
+                    CF_SPAN_TRACE,
+                    &keys::span_trace_key(ymd, &key[12..28], span_id),
+                )
+                .ok()
+                .flatten()
+                .and_then(|raw| SpanEnvelope::decode(raw.as_slice()).ok())
+            else {
+                continue;
+            };
+            let rh: [u8; HASH_LEN] = env
+                .resource_hash
+                .as_slice()
+                .try_into()
+                .unwrap_or([0; HASH_LEN]);
+            let attrs = match resource_memo.entry(rh) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(load_resource_attrs(store, &rh))
+                }
+            };
+            services.insert(
+                attrs
+                    .get("service.name")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".into()),
+            );
+            resource_attributes.extend(
+                attrs
+                    .keys()
+                    .filter(|key| key.as_str() != "service.name")
+                    .cloned(),
+            );
+            if let Some(span) = env.span {
+                names.insert(span.name);
+                span_attributes.extend(attr_map(&span.attributes).into_keys());
+            }
+        }
+    }
+    SpanOptions {
+        services: services.into_iter().take(500).collect(),
+        names: names.into_iter().take(500).collect(),
+        span_attributes: span_attributes.into_iter().take(500).collect(),
+        resource_attributes: resource_attributes.into_iter().take(500).collect(),
+    }
+}
+
 /// Bucket grid start offsets in ms.
 fn grid(from_ms: u64, bucket_ms: u64, n: usize) -> Vec<u64> {
     (0..n).map(|i| from_ms + i as u64 * bucket_ms).collect()
@@ -277,6 +416,24 @@ pub fn barchart(
     cap: usize,
     buckets: Option<usize>,
 ) -> Barchart {
+    let groups = match by {
+        GroupBy::None => Vec::new(),
+        GroupBy::Service => vec![GroupDimension::Service],
+        GroupBy::Name => vec![GroupDimension::Name],
+    };
+    barchart_grouped(store, from_ms, to_ms, &groups, svcs, &[], cap, buckets)
+}
+
+pub fn barchart_grouped(
+    store: &Store,
+    from_ms: u64,
+    to_ms: u64,
+    groups: &[GroupDimension],
+    svcs: &[String],
+    span_names: &[String],
+    cap: usize,
+    buckets: Option<usize>,
+) -> Barchart {
     let from_ns = from_ms * 1_000_000;
     let to_ns = to_ms * 1_000_000;
     let bucket_ms = pick_bucket_ms_for(to_ms - from_ms, buckets);
@@ -285,11 +442,12 @@ pub fn barchart(
     let first_ymd = keys::ymd(from_ns);
     let last_ymd = keys::ymd(to_ns - 1);
     let selected: HashSet<&str> = svcs.iter().map(String::as_str).collect();
-    let need_labels = by != GroupBy::None || !selected.is_empty();
+    let selected_names: HashSet<&str> = span_names.iter().map(String::as_str).collect();
+    let need_labels = !groups.is_empty() || !selected.is_empty() || !selected_names.is_empty();
 
     let mut counts: HashMap<String, Vec<u64>> = HashMap::new();
     let mut exemplars: HashMap<(usize, String), [String; 2]> = HashMap::new();
-    let mut svc_memo: HashMap<[u8; HASH_LEN], String> = HashMap::new();
+    let mut resource_memo: HashMap<[u8; HASH_LEN], BTreeMap<String, String>> = HashMap::new();
     let mut truncated = false;
     let mut scanned = 0usize;
 
@@ -317,12 +475,12 @@ pub fn barchart(
                 break 'outer;
             }
             scanned += 1;
-            let mut label = match by {
-                GroupBy::None => "spans".to_string(),
-                GroupBy::Service => String::new(),
-                GroupBy::Name => String::new(),
-            };
-            let mut svc: Option<String> = None;
+            let mut label = "spans".to_string();
+            let mut span_name = String::new();
+            let mut status = "unset".to_string();
+            let mut span_attrs = BTreeMap::new();
+            let empty_resource_attrs = BTreeMap::new();
+            let mut resource_attrs = &empty_resource_attrs;
             if need_labels {
                 let env = store
                     .get(CF_SPAN_TRACE, &keys::span_trace_key(ymd, trace_id, span_id))
@@ -335,29 +493,66 @@ pub fn barchart(
                         .as_slice()
                         .try_into()
                         .unwrap_or([0; HASH_LEN]);
-                    let name = match svc_memo.get(&rh) {
-                        Some(s) => s.clone(),
-                        None => {
-                            let s = service_of(store, &rh).unwrap_or_else(|| "unknown".into());
-                            svc_memo.insert(rh, s.clone());
-                            s
+                    resource_attrs = match resource_memo.entry(rh) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(load_resource_attrs(store, &rh))
                         }
                     };
-                    svc = Some(name.clone());
                     if let Some(span) = env.span {
-                        label = match by {
-                            GroupBy::None => "spans".to_string(),
-                            GroupBy::Service => name,
-                            GroupBy::Name => span.name,
-                        };
+                        span_name = span.name;
+                        if groups
+                            .iter()
+                            .any(|g| matches!(g, GroupDimension::SpanAttr(_)))
+                        {
+                            span_attrs = attr_map(&span.attributes);
+                        }
+                        status = match span.status.as_ref().map(|s| s.code).unwrap_or(0) {
+                            1 => "ok",
+                            2 => "error",
+                            _ => "unset",
+                        }
+                        .to_string();
                     }
                 }
-                if let Some(s) = &svc
-                    && !selected.is_empty()
-                    && !selected.contains(s.as_str())
+                let service = resource_attrs
+                    .get("service.name")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".into());
+                if (!selected.is_empty() && !selected.contains(service.as_str()))
+                    || (!selected_names.is_empty() && !selected_names.contains(span_name.as_str()))
                 {
                     continue;
                 }
+                let values: Vec<_> = groups
+                    .iter()
+                    .map(|group| {
+                        let value = match group {
+                            GroupDimension::Service => service.as_str(),
+                            GroupDimension::Name => span_name.as_str(),
+                            GroupDimension::Status => status.as_str(),
+                            GroupDimension::SpanAttr(key) => span_attrs
+                                .get(key)
+                                .map(String::as_str)
+                                .unwrap_or("(missing)"),
+                            GroupDimension::ResourceAttr(key) => resource_attrs
+                                .get(key)
+                                .map(String::as_str)
+                                .unwrap_or("(missing)"),
+                        };
+                        value.to_string()
+                    })
+                    .collect();
+                label = if groups.len() == 1 {
+                    values.into_iter().next().unwrap_or_else(|| "spans".into())
+                } else {
+                    groups
+                        .iter()
+                        .zip(values)
+                        .map(|(group, value)| format!("{}={value}", group.label_key()))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                };
             }
             let idx = usize::try_from((start_ns - from_ns) / bucket_ns).unwrap_or(0);
             let row = counts.entry(label.clone()).or_insert_with(|| vec![0; n]);

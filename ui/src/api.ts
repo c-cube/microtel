@@ -1,4 +1,12 @@
 export type GroupBy = "none" | "service" | "name";
+export type GroupDimension = "service" | "name" | "status" | `span:${string}` | `resource:${string}`;
+
+export interface SpanOptions {
+  services: string[];
+  names: string[];
+  span_attributes: string[];
+  resource_attributes: string[];
+}
 
 export interface Exemplar {
   t: number;
@@ -39,6 +47,9 @@ const json = async <T,>(r: Response): Promise<T> => {
 
 export const barchart = (q: string) =>
   fetch(`/api/spans/barchart?${q}`).then((r) => json<Barchart>(r));
+
+export const spanOptions = (q: string) =>
+  fetch(`/api/spans/options?${q}`).then((r) => json<SpanOptions>(r));
 
 export const series = () =>
   fetch("/api/metrics/series").then((r) => json<SeriesInfo[]>(r));

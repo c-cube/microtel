@@ -21,7 +21,7 @@ const formatter = (name: string) => {
 function MetricCard(props: { name: string; from: number; to: number; svcs: string[]; tick: number }) {
   const query = createMemo(() => {
     const q = new URLSearchParams({ name: props.name, from: String(props.from), to: String(props.to) });
-    if (props.svcs.length) q.set("svcs", props.svcs.join(","));
+    if (props.svcs.length) q.set("svcs", JSON.stringify(props.svcs));
     return q.toString();
   });
   const [pts, { refetch }] = createResource(query, (q) => points(q));
@@ -56,7 +56,7 @@ export default function Metrics() {
   const fromMs = () => Number(params.from ?? Date.now() - DEFAULT_RANGE_MS);
   const toMs = () => Number(params.to ?? Date.now() + TO_PAD_MS);
   const svcs = () => svcsList(params.svcs);
-  const selectedNames = () => stringList(params.names);
+  const selectedNames = () => stringList(params.metrics ?? params.names);
   const rf = () => Number(params.rf ?? 60_000);
 
   const [allSeries] = createResource(fetchSeries);
@@ -100,18 +100,18 @@ function MetricsBody(props: {
   const setRange = (ms: number) =>
     props.setParams({ from: Date.now() - ms, to: Date.now() + TO_PAD_MS }, { replace: true });
   const addName = (name: string) => {
-    if (name) props.setParams({ names: [...new Set([...props.selectedNames, name])].join(",") }, { replace: true });
+    if (name) props.setParams({ metrics: JSON.stringify([...new Set([...props.selectedNames, name])]), names: undefined }, { replace: true });
   };
   const removeName = (name: string) => {
     const next = props.selectedNames.filter((item) => item !== name);
-    props.setParams({ names: next.length ? next.join(",") : undefined }, { replace: true });
+    props.setParams({ metrics: next.length ? JSON.stringify(next) : undefined, names: undefined }, { replace: true });
   };
   const addService = (service: string) => {
-    if (service) props.setParams({ svcs: [...new Set([...props.svcs, service])].join(",") }, { replace: true });
+    if (service) props.setParams({ svcs: JSON.stringify([...new Set([...props.svcs, service])]) }, { replace: true });
   };
   const removeService = (service: string) => {
     const next = props.svcs.filter((item) => item !== service);
-    props.setParams({ svcs: next.length ? next.join(",") : undefined }, { replace: true });
+    props.setParams({ svcs: next.length ? JSON.stringify(next) : undefined }, { replace: true });
   };
 
   return (

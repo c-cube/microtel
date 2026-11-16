@@ -10,7 +10,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use include_dir::{Dir, include_dir};
 
-use crate::query::{self, GroupBy};
+use crate::query::{self, GroupBy, GroupDimension};
 use crate::store::Store;
 
 static DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
@@ -21,6 +21,7 @@ const DEFAULT_RANGE_MS: u64 = 3_600_000;
 pub fn router(store: Arc<Store>) -> Router {
     Router::new()
         .route("/api/spans/barchart", get(barchart))
+        .route("/api/spans/options", get(span_options))
         .route("/api/metrics/series", get(series))
         .route("/api/metrics/points", get(points))
         .route("/api/traces/{trace_id}", get(trace))
@@ -59,13 +60,44 @@ fn parse_range(p: &HashMap<String, String>) -> Result<(u64, u64), (StatusCode, &
 }
 
 fn parse_services(p: &HashMap<String, String>) -> Vec<String> {
-    param(p, "svcs")
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
+    parse_string_list(param(p, "svcs").unwrap_or(""))
+}
+
+fn parse_string_list(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_else(|_| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
+    })
+}
+
+fn parse_groups(p: &HashMap<String, String>) -> Result<Vec<GroupDimension>, ()> {
+    let Some(raw) = param(p, "groups") else {
+        return match GroupBy::parse(param(p, "group_by").unwrap_or("service")) {
+            Some(GroupBy::None) => Ok(Vec::new()),
+            Some(GroupBy::Service) => Ok(vec![GroupDimension::Service]),
+            Some(GroupBy::Name) => Ok(vec![GroupDimension::Name]),
+            None => Err(()),
+        };
+    };
+    let keys: Vec<String> = serde_json::from_str(raw).map_err(|_| ())?;
+    if keys.len() > 8 {
+        return Err(());
+    }
+    let mut groups = Vec::with_capacity(keys.len());
+    for key in keys {
+        let group = GroupDimension::parse(&key).ok_or(())?;
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    Ok(groups)
+}
+
+fn parse_span_names(p: &HashMap<String, String>) -> Vec<String> {
+    parse_string_list(param(p, "snames").unwrap_or(""))
 }
 
 async fn barchart(
@@ -76,24 +108,36 @@ async fn barchart(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    let by = match GroupBy::parse(param(&p, "group_by").unwrap_or("service")) {
-        Some(by) => by,
-        None => return (StatusCode::BAD_REQUEST, "invalid group_by").into_response(),
+    let groups = match parse_groups(&p) {
+        Ok(groups) => groups,
+        Err(()) => return (StatusCode::BAD_REQUEST, "invalid groups").into_response(),
     };
     let buckets = match bucket_param(&p) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
-    Json(query::barchart(
+    Json(query::barchart_grouped(
         &store,
         from,
         to,
-        by,
+        &groups,
         &parse_services(&p),
+        &parse_span_names(&p),
         query::SCAN_CAP,
         buckets,
     ))
     .into_response()
+}
+
+async fn span_options(
+    State(store): State<Arc<Store>>,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    let (from, to) = match parse_range(&p) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    Json(query::span_options(&store, from, to, query::SCAN_CAP)).into_response()
 }
 
 async fn trace(

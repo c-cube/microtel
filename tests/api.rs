@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use microtel::keys;
 use microtel::proto::{AttrSet, MetricKind, NumberDataPoint, Resource, SpanEnvelope, hash16};
-use microtel::query::{self, GroupBy};
+use microtel::query::{self, GroupBy, GroupDimension};
 use microtel::store::{MetricBatch, PointRow, SeriesRow, SpanBatch, SpanRow, Store};
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::metrics::v1 as otel_metrics;
@@ -176,6 +176,102 @@ fn barchart_group_by_none_and_name() {
         None,
     );
     assert_eq!(by_name.labels, vec!["op-a", "op-b"]);
+}
+
+#[test]
+fn barchart_groups_by_multiple_span_and_resource_dimensions() {
+    let (_dir, store) = store();
+    let resource = Resource {
+        attributes: vec![kv("service.name", "checkout"), kv("cloud.region", "west")],
+        ..Default::default()
+    };
+    let hash = hash16(&resource);
+    let mut row = span_row(hash, 1, 1, "POST /checkout", ns(BASE_MS, 0));
+    let mut env = SpanEnvelope::decode(row.envelope.as_slice()).unwrap();
+    let span = env.span.as_mut().unwrap();
+    span.attributes.push(kv("http.request.method", "POST"));
+    span.status = Some(opentelemetry_proto::tonic::trace::v1::Status {
+        code: 2,
+        message: "declined".into(),
+    });
+    row.envelope = env.encode_to_vec();
+    store
+        .apply_traces(&batch(vec![(hash, resource)], vec![row]))
+        .unwrap();
+
+    let groups = vec![
+        GroupDimension::Service,
+        GroupDimension::Name,
+        GroupDimension::Status,
+        GroupDimension::SpanAttr("http.request.method".into()),
+        GroupDimension::ResourceAttr("cloud.region".into()),
+    ];
+    let chart = query::barchart_grouped(
+        &store,
+        BASE_MS,
+        BASE_MS + RANGE_MS,
+        &groups,
+        &[],
+        &[],
+        query::SCAN_CAP,
+        None,
+    );
+    assert_eq!(
+        chart.labels,
+        vec![
+            "service.name=checkout · span.name=POST /checkout · status=error · span.http.request.method=POST · resource.cloud.region=west"
+        ]
+    );
+    let filtered = query::barchart_grouped(
+        &store,
+        BASE_MS,
+        BASE_MS + RANGE_MS,
+        &[],
+        &[],
+        &["POST /checkout".into()],
+        query::SCAN_CAP,
+        None,
+    );
+    assert_eq!(filtered.labels, vec!["spans"]);
+    assert_eq!(bucket_total(&filtered, "spans")[0], 1);
+    let empty = query::barchart_grouped(
+        &store,
+        BASE_MS,
+        BASE_MS + RANGE_MS,
+        &[],
+        &[],
+        &["not-this-span".into()],
+        query::SCAN_CAP,
+        None,
+    );
+    assert!(empty.labels.is_empty());
+}
+
+#[test]
+fn span_options_lists_services_names_and_custom_attributes() {
+    let (_dir, store) = store();
+    let resource = Resource {
+        attributes: vec![kv("service.name", "svc-a"), kv("cloud.region", "west")],
+        ..Default::default()
+    };
+    let hash = hash16(&resource);
+    let mut row = span_row(hash, 1, 1, "get-item", ns(BASE_MS, 0));
+    let mut env = SpanEnvelope::decode(row.envelope.as_slice()).unwrap();
+    env.span
+        .as_mut()
+        .unwrap()
+        .attributes
+        .push(kv("http.method", "GET"));
+    row.envelope = env.encode_to_vec();
+    store
+        .apply_traces(&batch(vec![(hash, resource)], vec![row]))
+        .unwrap();
+
+    let options = query::span_options(&store, BASE_MS, BASE_MS + RANGE_MS, query::SCAN_CAP);
+    assert_eq!(options.services, vec!["svc-a"]);
+    assert_eq!(options.names, vec!["get-item"]);
+    assert_eq!(options.span_attributes, vec!["http.method"]);
+    assert_eq!(options.resource_attributes, vec!["cloud.region"]);
 }
 
 #[test]
@@ -461,9 +557,9 @@ fn series_lists_name_and_attrs() {
 #[test]
 fn api_serves_charts_and_validates_params() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (mut child, addr) = spawn_server(dir.path(), None);
+    let (mut child, ingest, addr) = spawn_server(dir.path(), None);
 
-    run_emitter(&addr, 2, 2);
+    run_emitter(&ingest, 2, 2);
     std::thread::sleep(std::time::Duration::from_millis(1500));
 
     let to = common::now_ns() / 1_000_000 + 60_000;
@@ -504,6 +600,34 @@ fn api_serves_charts_and_validates_params() {
         .collect();
     assert!(labels.contains(&"emitter-a"));
 
+    let grouped: serde_json::Value = ureq::get(&format!(
+        "http://{addr}/api/spans/barchart?from={from}&to={to}&groups=%5B%22service%22%2C%22status%22%5D"
+    ))
+    .call()
+    .expect("multi-group barchart 200")
+    .into_json()
+    .expect("multi-group json");
+    assert!(grouped["labels"].as_array().unwrap().iter().any(|label| {
+        label
+            .as_str()
+            .unwrap_or_default()
+            .contains("service.name=emitter-a")
+    }));
+    let options: serde_json::Value = ureq::get(&format!(
+        "http://{addr}/api/spans/options?from={from}&to={to}"
+    ))
+    .call()
+    .expect("span options 200")
+    .into_json()
+    .expect("span options json");
+    assert!(
+        options["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "emitter-a")
+    );
+
     let status_of = |url: String| match ureq::get(&url).call() {
         Ok(r) => r.status(),
         Err(ureq::Error::Status(code, _)) => code,
@@ -518,6 +642,12 @@ fn api_serves_charts_and_validates_params() {
     assert_eq!(
         status_of(format!(
             "http://{addr}/api/spans/barchart?from={from}&to={to}&buckets=nope"
+        )),
+        400
+    );
+    assert_eq!(
+        status_of(format!(
+            "http://{addr}/api/spans/barchart?from={from}&to={to}&groups=bad"
         )),
         400
     );
@@ -688,7 +818,7 @@ fn trace_http_statuses() {
             ))
             .unwrap();
     }
-    let (mut child, addr) = spawn_server(dir.path(), None);
+    let (mut child, _ingest, addr) = spawn_server(dir.path(), None);
     let at = common::now_ns() / 1_000_000;
     let id = hex_id(&[9u8; 16]);
 
