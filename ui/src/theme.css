@@ -316,6 +316,9 @@ button, input, select { font-family: inherit; font-weight: inherit; }
   opacity: 0.8;
   pointer-events: none;
   font-size: 11px;
+  white-space: normal;
+  max-width: min(320px, calc(100vw - 24px));
+  overflow-wrap: anywhere;
 }
 .tip.pinned {
   width: max-content;

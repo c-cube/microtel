@@ -24,6 +24,7 @@ export interface PlotProps {
   fmt?: (v: number) => string;
   tipExemplar?: (idx: number, label: string) => string | undefined;
   tipLink?: (idx: number, label: string) => string | undefined;
+  tipLabel?: (label: string) => string;
   sync?: string;
   inlineLegend?: boolean;
 }
@@ -48,6 +49,22 @@ const escapeHtml = (value: string) =>
       default: return "&#39;";
     }
   });
+
+function segmentAt(u: uPlot, idx: number, y: number): number | undefined {
+  let below = 0;
+  for (let s = 1; s < u.series.length; s++) {
+    const ser = u.series[s];
+    if (!ser.show) continue;
+    const value = (u.data[s]?.[idx] as number | null) ?? 0;
+    if (value > 0) {
+      const yTop = u.valToPos(below + value, "y", true);
+      const yBot = u.valToPos(below, "y", true);
+      if (y >= yTop && y <= yBot) return s;
+    }
+    below += value;
+  }
+  return undefined;
+}
 
 // uPlot ships no stacked bars; paint cumulative rects per visible series after
 // the grid. Hidden series are skipped, so the stack reflows with the legend.
@@ -296,11 +313,20 @@ export default function Plot(props: PlotProps) {
               }
               const time = escapeHtml(fmtWhen(u.data[0][idx] as number));
               if (props.bars) {
-                let total = 0;
-                for (let s = 1; s < u.series.length; s++) {
-                  if (u.series[s].show) total += (u.data[s]?.[idx] as number | null) ?? 0;
+                const segment = segmentAt(u, idx, u.cursor.top ?? -1);
+                if (segment != null) {
+                  const key = String(u.series[segment].label ?? "");
+                  const label = props.tipLabel?.(key) ?? key;
+                  const value = (u.data[segment]?.[idx] as number | null) ?? 0;
+                  const dot = color(paletteIdx.get(key) ?? 0);
+                  tip.innerHTML = `<div>${time}</div><div class="row"><span class="sw" style="background:${dot}"></span>${escapeHtml(label)} <span class="dim">·</span> ${fmt(value)} spans</div>`;
+                } else {
+                  let total = 0;
+                  for (let s = 1; s < u.series.length; s++) {
+                    if (u.series[s].show) total += (u.data[s]?.[idx] as number | null) ?? 0;
+                  }
+                  tip.innerHTML = `<div>${time}</div><div>${fmt(total)} spans</div>`;
                 }
-                tip.innerHTML = `<div>${time}</div><div>${fmt(total)} spans</div>`;
                 showTip("preview");
               } else {
                 let html = `<div>${time}</div>`;
@@ -339,41 +365,31 @@ export default function Plot(props: PlotProps) {
           return;
         }
         const ypx = plot.cursor.top ?? -1;
-        let below = 0;
-        for (let s = 1; s < plot.series.length; s++) {
-          const ser = plot.series[s];
-          const v = (plot.data[s]?.[idx] as number | null) ?? 0;
-          if (!ser.show || v <= 0) {
-            if (ser.show) below += v;
-            continue;
-          }
-          const yTop = plot.valToPos(below + v, "y", true);
-          const yBot = plot.valToPos(below, "y", true);
-          if (ypx >= yTop && ypx <= yBot) {
-            const label = String(ser.label ?? "");
-            const value = (plot.data[s]?.[idx] as number | null) ?? null;
-            const dot = color(paletteIdx.get(label) ?? 0);
-            const ex = props.tipExemplar?.(idx, label);
-            const href = props.tipLink?.(idx, label);
-            let html = `<div class="tip-time">${escapeHtml(fmtWhen(plot.data[0][idx] as number))}</div>`;
-            html += `<div class="tip-group"><span class="sw" style="background:${dot}"></span>${escapeHtml(label)}</div>`;
-            html += `<div class="tip-count">${value == null ? "–" : fmt(value)} spans</div>`;
-            html += ex && href
-              ? `<div class="tip-trace"><a href="${escapeHtml(href)}">↳ ${escapeHtml(ex)} · open trace</a></div>`
-              : `<div class="tip-empty">no trace exemplar in this bucket</div>`;
-            html += `<div class="tip-dismiss">Esc or click outside to close</div>`;
-            tip.innerHTML = html;
-            tip.tabIndex = -1;
-            setPinned({ label, time: plot.data[0][idx] as number });
-            showTip("pinned");
-            positionTip(plot);
-            plot.redraw();
-            tip.focus({ preventScroll: true });
-            return;
-          }
-          below += v;
+        const segment = segmentAt(plot, idx, ypx);
+        if (segment == null) {
+          dismissPinned();
+          return;
         }
-        dismissPinned();
+        const key = String(plot.series[segment].label ?? "");
+        const label = props.tipLabel?.(key) ?? key;
+        const value = (plot.data[segment]?.[idx] as number | null) ?? null;
+        const dot = color(paletteIdx.get(key) ?? 0);
+        const ex = props.tipExemplar?.(idx, key);
+        const href = props.tipLink?.(idx, key);
+        let html = `<div class="tip-time">${escapeHtml(fmtWhen(plot.data[0][idx] as number))}</div>`;
+        html += `<div class="tip-group"><span class="sw" style="background:${dot}"></span>${escapeHtml(label)}</div>`;
+        html += `<div class="tip-count">${value == null ? "–" : fmt(value)} spans</div>`;
+        html += ex && href
+          ? `<div class="tip-trace"><a href="${escapeHtml(href)}">↳ ${escapeHtml(ex)} · open trace</a></div>`
+          : `<div class="tip-empty">no trace exemplar in this bucket</div>`;
+        html += `<div class="tip-dismiss">Esc or click outside to close</div>`;
+        tip.innerHTML = html;
+        tip.tabIndex = -1;
+        setPinned({ label: key, time: plot.data[0][idx] as number });
+        showTip("pinned");
+        positionTip(plot);
+        plot.redraw();
+        tip.focus({ preventScroll: true });
       });
     }
   };

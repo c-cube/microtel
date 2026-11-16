@@ -27,8 +27,8 @@ export default function Spans() {
   const optionsQuery = createMemo(() => new URLSearchParams({ from: String(fromMs()), to: String(toMs()) }).toString());
   const [options] = createResource(optionsQuery, (q) => spanOptions(q));
 
-  // each bar slot gets at least MIN_SLOT_PX so it stays comfortably clickable;
-  // the server snaps to the finest step that fits this many buckets
+  // Size the base histogram to 22px slots; the server adds about 20% more
+  // buckets after snapping, making the displayed bars a little narrower.
   const MIN_SLOT_PX = 22;
   const [want, setWant] = createSignal(60);
   let cardEl: HTMLElement | undefined;
@@ -129,6 +129,11 @@ export default function Spans() {
     const [scope, key] = g.split(":", 2);
     return `${scope} · ${key}`;
   };
+  const tipGroupLabel = (label: string) => {
+    const active = groups();
+    const group = active.length === 1 ? active[0] : undefined;
+    return group && label !== "other" ? `${groupLabel(group)}: ${label}` : label;
+  };
   const serviceOnly = () => groups().length === 1 && groups()[0] === "service";
 
   const plotSeries = () => {
@@ -167,8 +172,9 @@ export default function Spans() {
 
   const bucketLabel = () => {
     const ms = chart()?.bucket_ms ?? 0;
-    if (ms >= 3_600_000) return `${ms / 3_600_000}h`;
-    if (ms >= 60_000) return `${ms / 60_000}m`;
+    if (ms >= 3_600_000 && ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+    if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000}m`;
+    if (ms >= 1_000) return `${Math.round(ms / 1_000)}s`;
     return `${ms / 1000}s`;
   };
 
@@ -308,6 +314,7 @@ export default function Spans() {
             bars
             legend={false}
             height={420}
+            tipLabel={tipGroupLabel}
             tipExemplar={exemplarText}
             tipLink={exemplarHref}
           />

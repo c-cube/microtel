@@ -11,7 +11,7 @@ use opentelemetry_proto::tonic::trace::v1::Span;
 use prost::Message;
 
 const BASE_MS: u64 = 1_750_000_000_000;
-const RANGE_MS: u64 = 6 * 3_600_000; // 2-minute buckets for this range
+const RANGE_MS: u64 = 6 * 3_600_000; // 2-minute base buckets; barcharts display ~20% more
 
 fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -125,18 +125,18 @@ fn barchart_counts_groups_by_service() {
         query::SCAN_CAP,
         None,
     );
-    assert_eq!(chart.bucket_ms, 120_000);
+    assert_eq!(chart.bucket_ms, 100_000);
     assert!(!chart.truncated);
     assert_eq!(chart.labels, vec!["svc-a", "svc-b"]);
     assert_eq!(bucket_total(&chart, "svc-a"), {
-        let mut v = vec![0u64; 180];
+        let mut v = vec![0u64; 216];
         v[0] = 1;
         v[1] = 1;
         v[2] = 1;
         v
     });
     assert_eq!(bucket_total(&chart, "svc-b")[1], 1);
-    assert_eq!(chart.buckets[0][1], BASE_MS + 120_000);
+    assert_eq!(chart.buckets[0][1], BASE_MS + 100_000);
 }
 
 #[test]
@@ -331,7 +331,7 @@ fn barchart_exemplars_are_first_seen_per_bucket_and_group() {
     assert_eq!(first.trace_id, "01".repeat(16));
     assert_eq!(first.span_id, "11".repeat(8));
     assert_eq!(chart.exemplars[1].trace_id, "02".repeat(16));
-    assert_eq!(chart.exemplars[1].t, BASE_MS + 120_000);
+    assert_eq!(chart.exemplars[1].t, BASE_MS + 100_000);
 }
 
 #[test]
@@ -579,7 +579,7 @@ fn api_serves_charts_and_validates_params() {
     .expect("barchart 200")
     .into_json()
     .expect("barchart json");
-    assert_eq!(chart["bucket_ms"].as_u64().unwrap(), 15_000);
+    assert_eq!(chart["bucket_ms"].as_u64().unwrap(), 12_500);
     assert!(
         chart["buckets"]
             .as_array()
@@ -861,9 +861,9 @@ fn bucket_count_is_client_driven_and_capped() {
         query::SCAN_CAP,
         Some(20),
     );
-    // 1h / 20 -> a snapped 3m step, so exactly 20 buckets
-    assert_eq!(chart.bucket_ms, 180_000);
-    assert_eq!(chart.buckets[0].len(), 20);
+    // 1h / 20 -> 20 base buckets, then 20% denser for the bar chart.
+    assert_eq!(chart.bucket_ms, 150_000);
+    assert_eq!(chart.buckets[0].len(), 24);
 
     let fine = query::barchart(
         &store,
@@ -875,7 +875,8 @@ fn bucket_count_is_client_driven_and_capped() {
         Some(100_000),
     );
     assert!(fine.buckets[0].len() <= query::MAX_BUCKETS);
-    assert_eq!(fine.bucket_ms, query::pick_bucket_ms(3_600_000));
+    assert_eq!(fine.bucket_ms, 12_500);
+    assert_eq!(fine.buckets[0].len(), 288);
 
     let coarse = query::barchart(
         &store,

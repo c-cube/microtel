@@ -46,6 +46,16 @@ pub fn pick_bucket_ms_for(range_ms: u64, want: Option<usize>) -> u64 {
         .unwrap_or(*STEPS_MS.last().expect("non-empty"))
 }
 
+fn pick_barchart_bucket_ms_for(range_ms: u64, want: Option<usize>) -> u64 {
+    let base_step = pick_bucket_ms_for(range_ms, want);
+    let base_count = range_ms.div_ceil(base_step).max(1);
+    let denser_count = base_count
+        .saturating_mul(6)
+        .div_ceil(5)
+        .min(MAX_BUCKETS as u64);
+    range_ms.div_ceil(denser_count).max(1_000)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupBy {
     None,
@@ -436,7 +446,7 @@ pub fn barchart_grouped(
 ) -> Barchart {
     let from_ns = from_ms * 1_000_000;
     let to_ns = to_ms * 1_000_000;
-    let bucket_ms = pick_bucket_ms_for(to_ms - from_ms, buckets);
+    let bucket_ms = pick_barchart_bucket_ms_for(to_ms - from_ms, buckets);
     let bucket_ns = bucket_ms * 1_000_000;
     let n = usize::try_from((to_ns - from_ns).div_ceil(bucket_ns)).unwrap_or(1);
     let first_ymd = keys::ymd(from_ns);
@@ -543,15 +553,15 @@ pub fn barchart_grouped(
                         value.to_string()
                     })
                     .collect();
-                label = if groups.len() == 1 {
-                    values.into_iter().next().unwrap_or_else(|| "spans".into())
-                } else {
-                    groups
+                label = match groups.len() {
+                    0 => "spans".into(),
+                    1 => values.into_iter().next().unwrap_or_else(|| "spans".into()),
+                    _ => groups
                         .iter()
                         .zip(values)
                         .map(|(group, value)| format!("{}={value}", group.label_key()))
                         .collect::<Vec<_>>()
-                        .join(" · ")
+                        .join(" · "),
                 };
             }
             let idx = usize::try_from((start_ns - from_ns) / bucket_ns).unwrap_or(0);
@@ -801,5 +811,29 @@ pub fn points(
         truncated,
         t: grid(from_ms, bucket_ms, n),
         lines,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pick_barchart_bucket_ms_for, pick_bucket_ms_for};
+
+    #[test]
+    fn barchart_uses_about_twenty_percent_more_buckets() {
+        let range_ms = 60_u64 * 60 * 1_000;
+        let want = Some(54);
+        let base = range_ms.div_ceil(pick_bucket_ms_for(range_ms, want));
+        let dense = range_ms.div_ceil(pick_barchart_bucket_ms_for(range_ms, want));
+
+        assert_eq!(base, 30);
+        assert_eq!(dense, 36);
+    }
+
+    #[test]
+    fn barchart_respects_the_bucket_limit() {
+        let range_ms = 365_u64 * 24 * 60 * 60 * 1_000;
+        let dense = range_ms.div_ceil(pick_barchart_bucket_ms_for(range_ms, None));
+
+        assert_eq!(dense, 300);
     }
 }
