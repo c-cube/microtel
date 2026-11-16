@@ -195,7 +195,7 @@ export default function Spans() {
           if (value && groups().length < 8 && validGroup(value) && !groups().includes(value)) setGroups([...groups(), value]);
           e.currentTarget.value = "";
         }}>
-          <option value="" disabled>add group by…</option>
+          <option value="">add group by…</option>
           <optgroup label="Built in">
             <For each={BUILTIN_GROUPS.filter((g) => !groups().includes(g))}>{(g) => <option value={g}>{groupLabel(g)}</option>}</For>
           </optgroup>
@@ -214,14 +214,14 @@ export default function Spans() {
           addService(e.currentTarget.value);
           e.currentTarget.value = "";
         }}>
-          <option value="" disabled>filter service…</option>
+          <option value="">filter service…</option>
           <For each={(options()?.services ?? []).filter((s) => !svcs().includes(s))}>{(s) => <option value={s}>{s}</option>}</For>
         </select>
         <select class="ctl" value="" aria-label="Filter span names" onChange={(e) => {
           addSpanName(e.currentTarget.value);
           e.currentTarget.value = "";
         }}>
-          <option value="" disabled>filter span name…</option>
+          <option value="">filter span name…</option>
           <For each={(options()?.names ?? []).filter((s) => !spanNames().includes(s))}>{(s) => <option value={s}>{s}</option>}</For>
         </select>
         <select

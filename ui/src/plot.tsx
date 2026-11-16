@@ -121,6 +121,9 @@ export default function Plot(props: PlotProps) {
   let host!: HTMLDivElement;
   let tip!: HTMLDivElement;
   let up: uPlot | undefined;
+  let hoverFrame = 0;
+  let hoverTarget: uPlot | undefined;
+  let lastHoverIdx: number | null | undefined;
   const [hidden, setHidden] = createSignal<Record<string, boolean>>({});
   const [pinned, setPinned] = createSignal<{ label: string; time: number } | null>(null);
   // Defer hiding transient hover tips so the pointer can reach them. Bar
@@ -144,7 +147,7 @@ export default function Plot(props: PlotProps) {
     clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
       if (!pinned() && !overTip) tip.style.display = "none";
-    }, 320);
+    }, props.bars ? 60 : 320);
   };
   const dismissPinned = () => {
     setPinned(null);
@@ -225,6 +228,10 @@ export default function Plot(props: PlotProps) {
   };
 
   const build = () => {
+    if (hoverFrame) cancelAnimationFrame(hoverFrame);
+    hoverFrame = 0;
+    hoverTarget = undefined;
+    lastHoverIdx = undefined;
     if (up) {
       up.destroy();
       up = undefined;
@@ -235,6 +242,19 @@ export default function Plot(props: PlotProps) {
     const series = visibleSeries();
     const spanMs = props.t.length > 1 ? props.t[props.t.length - 1] - props.t[0] : 3_600_000;
     const paletteIdx = new Map(props.series.map((s, i) => [s.label, i]));
+    const scheduleHoverRedraw = (u: uPlot) => {
+      const idx = u.cursor.idx ?? null;
+      if (idx === lastHoverIdx) return;
+      lastHoverIdx = idx;
+      hoverTarget = u;
+      if (hoverFrame) return;
+      hoverFrame = requestAnimationFrame(() => {
+        hoverFrame = 0;
+        const target = hoverTarget;
+        hoverTarget = undefined;
+        if (target && up === target) target.redraw();
+      });
+    };
     const [y0, y1] = yRange();
     const css = getComputedStyle(document.documentElement);
     const cssVar = (name: string, fallback: string) => css.getPropertyValue(name).trim() || fallback;
@@ -306,6 +326,7 @@ export default function Plot(props: PlotProps) {
           hooks: {
             setCursor: (u) => {
               if (pinned()) return;
+              if (props.bars) scheduleHoverRedraw(u);
               const idx = u.cursor.idx;
               if (idx == null || u.data[0]?.[idx] == null) {
                 hideTipSoon();
@@ -440,7 +461,11 @@ export default function Plot(props: PlotProps) {
       document.removeEventListener("pointerdown", onOutsidePointerDown, true);
       window.removeEventListener("keydown", onEscape);
       clearTimeout(hideTimer);
+      if (hoverFrame) cancelAnimationFrame(hoverFrame);
+      hoverFrame = 0;
+      hoverTarget = undefined;
       up?.destroy();
+      up = undefined;
     });
   });
 
