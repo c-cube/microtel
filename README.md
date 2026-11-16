@@ -9,3 +9,9 @@ for my VPS, that will consume very little resources, so here we are:
 - serves a basic API + solidjs UI (pure vibes ✨)
 
 That's it. It seems to be fine for me and runs in a few dozen MBs of memory.
+
+## web UI
+
+![Traces](media/traces.png)
+
+![Metrics](media/metrics.png)
