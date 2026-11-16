@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, on, onCleanup, onMount } from "solid-js";
 import uPlot from "uplot";
 import { fmtCount, fmtWhen } from "./api";
 import { resolved } from "./theme";
@@ -68,7 +68,7 @@ function segmentAt(u: uPlot, idx: number, y: number): number | undefined {
 
 // uPlot ships no stacked bars; paint cumulative rects per visible series after
 // the grid. Hidden series are skipped, so the stack reflows with the legend.
-function stackedBars(pinned: () => { time: number } | null): uPlot.Plugin {
+function stackedBars(): uPlot.Plugin {
   return {
     hooks: {
       draw: (u: uPlot) => {
@@ -83,13 +83,6 @@ function stackedBars(pinned: () => { time: number } | null): uPlot.Plugin {
         ctx.beginPath();
         ctx.rect(u.bbox.left, u.bbox.top, u.bbox.width, u.bbox.height);
         ctx.clip();
-        const pinnedTime = pinned()?.time;
-        const selected = pinnedTime == null ? -1 : u.data[0].indexOf(pinnedTime);
-        const hovered = selected >= 0 ? selected : u.cursor.idx;
-        if (hovered != null && hovered < n) {
-          ctx.fillStyle = "rgba(128,140,160,0.18)";
-          ctx.fillRect(px(hovered) - slot / 2, u.bbox.top, slot, u.bbox.height);
-        }
         for (let i = 0; i < n; i++) {
           let below = 0;
           const x = px(i) - w / 2;
@@ -121,32 +114,48 @@ export default function Plot(props: PlotProps) {
   let host!: HTMLDivElement;
   let tip!: HTMLDivElement;
   let up: uPlot | undefined;
-  let hoverFrame = 0;
-  let hoverTarget: uPlot | undefined;
-  let lastHoverIdx: number | null | undefined;
+  let columnHighlight: HTMLDivElement | undefined;
+  let highlightedIdx: number | null | undefined;
+  let updateColumnHighlight:
+    | ((plot: uPlot, idx?: number | null, force?: boolean) => void)
+    | undefined;
+  let tipKind: "preview" | "hover" | "pinned" | undefined;
+  let tipHtml = "";
   const [hidden, setHidden] = createSignal<Record<string, boolean>>({});
   const [pinned, setPinned] = createSignal<{ label: string; time: number } | null>(null);
   // Defer hiding transient hover tips so the pointer can reach them. Bar
   // details are pinned separately and only close on Escape or an outside click.
   let overTip = false;
   let hideTimer = 0;
+  const setTipHtml = (html: string) => {
+    if (tipHtml === html) return;
+    tipHtml = html;
+    tip.innerHTML = html;
+  };
   const showTip = (kind: "preview" | "hover" | "pinned") => {
-    clearTimeout(hideTimer);
-    tip.classList.toggle("preview", kind === "preview");
-    tip.classList.toggle("pinned", kind === "pinned");
-    if (kind === "pinned") {
-      tip.setAttribute("role", "dialog");
-      tip.setAttribute("aria-label", "Span bucket details");
-    } else {
-      tip.setAttribute("role", "tooltip");
-      tip.removeAttribute("aria-label");
+    if (hideTimer) {
+      clearTimeout(hideTimer);
+      hideTimer = 0;
     }
-    tip.style.display = "block";
+    if (tipKind !== kind) {
+      tip.classList.toggle("preview", kind === "preview");
+      tip.classList.toggle("pinned", kind === "pinned");
+      if (kind === "pinned") {
+        tip.setAttribute("role", "dialog");
+        tip.setAttribute("aria-label", "Span bucket details");
+      } else {
+        tip.setAttribute("role", "tooltip");
+        tip.removeAttribute("aria-label");
+      }
+      tipKind = kind;
+    }
+    if (tip.style.display !== "block") tip.style.display = "block";
   };
   const hideTipSoon = () => {
-    clearTimeout(hideTimer);
+    if (hideTimer) clearTimeout(hideTimer);
     hideTimer = window.setTimeout(() => {
       if (!pinned() && !overTip) tip.style.display = "none";
+      hideTimer = 0;
     }, props.bars ? 60 : 320);
   };
   const dismissPinned = () => {
@@ -156,7 +165,8 @@ export default function Plot(props: PlotProps) {
     tip.classList.remove("preview");
     tip.setAttribute("role", "tooltip");
     tip.removeAttribute("aria-label");
-    up?.redraw();
+    tipKind = undefined;
+    if (up) updateColumnHighlight?.(up, up.cursor.idx, true);
   };
 
   const positionTip = (u: uPlot) => {
@@ -166,11 +176,14 @@ export default function Plot(props: PlotProps) {
     const flip = left > u.bbox.width - Math.min(300, tip.offsetWidth);
     const maxLeft = Math.max(0, (tipBox?.clientWidth ?? box.clientWidth) - tip.offsetWidth);
     const preferredLeft = flip ? left - tip.offsetWidth - gap : left + gap;
-    tip.style.left = `${Math.min(maxLeft, Math.max(0, preferredLeft))}px`;
-    tip.style.top = `${Math.min(
+    const top = Math.min(
       Math.max(0, (tipBox?.clientHeight ?? box.clientHeight) - tip.offsetHeight),
       Math.max(0, (u.cursor.top ?? 0) - 12),
-    )}px`;
+    );
+    const nextLeft = `${Math.min(maxLeft, Math.max(0, preferredLeft))}px`;
+    const nextTop = `${top}px`;
+    if (tip.style.left !== nextLeft) tip.style.left = nextLeft;
+    if (tip.style.top !== nextTop) tip.style.top = nextTop;
   };
   const clampTip = () => {
     const tipBox = tip.parentElement;
@@ -228,10 +241,9 @@ export default function Plot(props: PlotProps) {
   };
 
   const build = () => {
-    if (hoverFrame) cancelAnimationFrame(hoverFrame);
-    hoverFrame = 0;
-    hoverTarget = undefined;
-    lastHoverIdx = undefined;
+    columnHighlight = undefined;
+    highlightedIdx = undefined;
+    updateColumnHighlight = undefined;
     if (up) {
       up.destroy();
       up = undefined;
@@ -242,18 +254,28 @@ export default function Plot(props: PlotProps) {
     const series = visibleSeries();
     const spanMs = props.t.length > 1 ? props.t[props.t.length - 1] - props.t[0] : 3_600_000;
     const paletteIdx = new Map(props.series.map((s, i) => [s.label, i]));
-    const scheduleHoverRedraw = (u: uPlot) => {
-      const idx = u.cursor.idx ?? null;
-      if (idx === lastHoverIdx) return;
-      lastHoverIdx = idx;
-      hoverTarget = u;
-      if (hoverFrame) return;
-      hoverFrame = requestAnimationFrame(() => {
-        hoverFrame = 0;
-        const target = hoverTarget;
-        hoverTarget = undefined;
-        if (target && up === target) target.redraw();
-      });
+    updateColumnHighlight = (plot, cursorIdx = plot.cursor.idx, force = false) => {
+      const highlight = columnHighlight;
+      if (!highlight) return;
+      const pinnedTime = pinned()?.time;
+      const idx = pinnedTime == null ? cursorIdx : plot.data[0].indexOf(pinnedTime);
+      const nextIdx = idx != null && idx >= 0 && idx < plot.data[0].length ? idx : null;
+      if (!force && nextIdx === highlightedIdx) return;
+      highlightedIdx = nextIdx;
+      if (nextIdx == null) {
+        if (highlight.style.display !== "none") highlight.style.display = "none";
+        return;
+      }
+      const px = (i: number) => plot.valToPos(plot.data[0][i] as number, "x", true);
+      const slot = plot.data[0].length > 1
+        ? Math.abs(px(1) - px(0))
+        : plot.bbox.width;
+      const left = px(nextIdx) - slot / 2 - plot.bbox.left;
+      const width = `${slot}px`;
+      const transform = `translateX(${left}px)`;
+      if (highlight.style.width !== width) highlight.style.width = width;
+      if (highlight.style.transform !== transform) highlight.style.transform = transform;
+      if (highlight.style.display !== "block") highlight.style.display = "block";
     };
     const [y0, y1] = yRange();
     const css = getComputedStyle(document.documentElement);
@@ -321,12 +343,12 @@ export default function Plot(props: PlotProps) {
         },
       ],
       plugins: [
-        ...(props.bars ? [stackedBars(pinned)] : []),
+        ...(props.bars ? [stackedBars()] : []),
         {
           hooks: {
             setCursor: (u) => {
               if (pinned()) return;
-              if (props.bars) scheduleHoverRedraw(u);
+              if (props.bars) updateColumnHighlight?.(u, u.cursor.idx);
               const idx = u.cursor.idx;
               if (idx == null || u.data[0]?.[idx] == null) {
                 hideTipSoon();
@@ -340,13 +362,15 @@ export default function Plot(props: PlotProps) {
                   const label = props.tipLabel?.(key) ?? key;
                   const value = (u.data[segment]?.[idx] as number | null) ?? 0;
                   const dot = color(paletteIdx.get(key) ?? 0);
-                  tip.innerHTML = `<div>${time}</div><div class="row"><span class="sw" style="background:${dot}"></span>${escapeHtml(label)} <span class="dim">·</span> ${fmt(value)} spans</div>`;
+                  setTipHtml(
+                    `<div>${time}</div><div class="row"><span class="sw" style="background:${dot}"></span>${escapeHtml(label)} <span class="dim">·</span> ${fmt(value)} spans</div>`,
+                  );
                 } else {
                   let total = 0;
                   for (let s = 1; s < u.series.length; s++) {
                     if (u.series[s].show) total += (u.data[s]?.[idx] as number | null) ?? 0;
                   }
-                  tip.innerHTML = `<div>${time}</div><div>${fmt(total)} spans</div>`;
+                  setTipHtml(`<div>${time}</div><div>${fmt(total)} spans</div>`);
                 }
                 showTip("preview");
               } else {
@@ -365,7 +389,7 @@ export default function Plot(props: PlotProps) {
                       : `<div class="row"><span class="dim">↳ ${escapeHtml(ex)}</span></div>`;
                   }
                 }
-                tip.innerHTML = html;
+                setTipHtml(html);
                 showTip("hover");
               }
               positionTip(u);
@@ -378,6 +402,10 @@ export default function Plot(props: PlotProps) {
     up = new uPlot(opts, [props.t, ...series.map((s) => s.values)], host);
 
     if (props.bars) {
+      columnHighlight = document.createElement("div");
+      columnHighlight.className = "plot-column-highlight";
+      up.under.appendChild(columnHighlight);
+      updateColumnHighlight(up, up.cursor.idx, true);
       up.over.addEventListener("click", () => {
         const plot = up;
         const idx = plot?.cursor.idx;
@@ -404,12 +432,12 @@ export default function Plot(props: PlotProps) {
           ? `<div class="tip-trace"><a href="${escapeHtml(href)}">↳ ${escapeHtml(ex)} · open trace</a></div>`
           : `<div class="tip-empty">no trace exemplar in this bucket</div>`;
         html += `<div class="tip-dismiss">Esc or click outside to close</div>`;
-        tip.innerHTML = html;
+        setTipHtml(html);
         tip.tabIndex = -1;
         setPinned({ label: key, time: plot.data[0][idx] as number });
         showTip("pinned");
         positionTip(plot);
-        plot.redraw();
+        updateColumnHighlight?.(plot, idx, true);
         tip.focus({ preventScroll: true });
       });
     }
@@ -449,7 +477,10 @@ export default function Plot(props: PlotProps) {
 
     const ro = new ResizeObserver(() => {
       const w = host.clientWidth;
-      if (up && w > 0) up.setSize({ width: w, height: props.height ?? 380 });
+      if (up && w > 0) {
+        up.setSize({ width: w, height: props.height ?? 380 });
+        if (props.bars) updateColumnHighlight?.(up, up.cursor.idx, true);
+      }
       if (pinned()) clampTip();
     });
     ro.observe(host);
@@ -461,21 +492,14 @@ export default function Plot(props: PlotProps) {
       document.removeEventListener("pointerdown", onOutsidePointerDown, true);
       window.removeEventListener("keydown", onEscape);
       clearTimeout(hideTimer);
-      if (hoverFrame) cancelAnimationFrame(hoverFrame);
-      hoverFrame = 0;
-      hoverTarget = undefined;
       up?.destroy();
       up = undefined;
     });
   });
 
-  createEffect(() => {
-    props.t;
-    props.series;
-    hidden();
-    resolved();
-    build();
-  });
+  createEffect(
+    on([() => props.t, () => props.series, hidden, resolved], () => build(), { defer: true }),
+  );
 
   return (
     <div ref={box}>
