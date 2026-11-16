@@ -7,7 +7,7 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, post};
 use prost::Message;
 use tokio::sync::mpsc;
 
@@ -32,8 +32,6 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/traces", post(traces))
         .route("/v1/metrics", post(metrics))
         .route("/v1/logs", any(logs))
-        .route("/health", get(health))
-        .route("/stats", get(stats))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(app)
 }
@@ -213,14 +211,6 @@ async fn logs(State(app): State<Arc<App>>) -> Response {
     let resp = (StatusCode::NOT_IMPLEMENTED, "logs signal not supported").into_response();
     app.stats.request(Endpoint::Logs, resp.status().as_u16());
     resp
-}
-
-async fn health() -> &'static str {
-    "ok"
-}
-
-async fn stats(State(app): State<Arc<App>>) -> String {
-    app.stats.render(&app.store)
 }
 
 /// 415 on an explicitly wrong content type; absent header defers to body parsing.

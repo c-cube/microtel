@@ -6,10 +6,20 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub storage_dir: PathBuf,
+    /// OTLP ingestion endpoint.
     pub listen: String,
+    /// UI/API endpoint; `None` disables the UI (CLI-only, via --no-ui).
+    #[serde(default = "default_ui")]
+    pub ui: Option<Ui>,
     pub ttl_days: u32,
     pub queue: Queue,
     pub purge_interval_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct Ui {
+    pub listen: String,
 }
 
 /// Per-signal queue settings (traces and metrics each get their own queue).
@@ -26,11 +36,24 @@ impl Default for Config {
         Config {
             storage_dir: PathBuf::from("./data"),
             listen: "127.0.0.1:4318".into(),
+            ui: default_ui(),
             ttl_days: 30,
             queue: Queue::default(),
             purge_interval_secs: 86_400,
         }
     }
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Ui {
+            listen: "127.0.0.1:8096".into(),
+        }
+    }
+}
+
+fn default_ui() -> Option<Ui> {
+    Some(Ui::default())
 }
 
 impl Default for Queue {
@@ -46,6 +69,8 @@ impl Default for Queue {
 pub fn load(
     config_path: Option<PathBuf>,
     listen: Option<String>,
+    ui_listen: Option<String>,
+    no_ui: bool,
     storage_dir: Option<PathBuf>,
     ttl_days: Option<u32>,
 ) -> anyhow::Result<Config> {
@@ -63,6 +88,12 @@ pub fn load(
     };
     if let Some(v) = listen {
         cfg.listen = v;
+    }
+    if let Some(v) = ui_listen {
+        cfg.ui = Some(Ui { listen: v });
+    }
+    if no_ui {
+        cfg.ui = None;
     }
     if let Some(v) = storage_dir {
         cfg.storage_dir = v;

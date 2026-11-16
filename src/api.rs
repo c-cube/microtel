@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use include_dir::{Dir, include_dir};
 
 use crate::query::{self, GroupBy, GroupDimension};
+use crate::stats::Stats;
 use crate::store::Store;
 
 static DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
@@ -18,15 +19,30 @@ static DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/ui/dist");
 const MAX_RANGE_MS: u64 = 35 * 86_400_000;
 const DEFAULT_RANGE_MS: u64 = 3_600_000;
 
-pub fn router(store: Arc<Store>) -> Router {
+pub struct Api {
+    pub store: Arc<Store>,
+    pub stats: Arc<Stats>,
+}
+
+pub fn router(api: Arc<Api>) -> Router {
     Router::new()
         .route("/api/spans/barchart", get(barchart))
         .route("/api/spans/options", get(span_options))
         .route("/api/metrics/series", get(series))
         .route("/api/metrics/points", get(points))
         .route("/api/traces/{trace_id}", get(trace))
+        .route("/health", get(health))
+        .route("/stats", get(stats))
         .fallback(ui)
-        .with_state(store)
+        .with_state(api)
+}
+
+async fn health() -> &'static str {
+    "ok"
+}
+
+async fn stats(State(api): State<Arc<Api>>) -> String {
+    api.stats.render(&api.store)
 }
 
 fn now_ms() -> u64 {
@@ -101,9 +117,10 @@ fn parse_span_names(p: &HashMap<String, String>) -> Vec<String> {
 }
 
 async fn barchart(
-    State(store): State<Arc<Store>>,
+    State(api): State<Arc<Api>>,
     Query(p): Query<HashMap<String, String>>,
 ) -> Response {
+    let store = &api.store;
     let (from, to) = match parse_range(&p) {
         Ok(r) => r,
         Err(e) => return e.into_response(),
@@ -117,7 +134,7 @@ async fn barchart(
         Err(e) => return e.into_response(),
     };
     Json(query::barchart_grouped(
-        &store,
+        store,
         from,
         to,
         &groups,
@@ -130,21 +147,23 @@ async fn barchart(
 }
 
 async fn span_options(
-    State(store): State<Arc<Store>>,
+    State(api): State<Arc<Api>>,
     Query(p): Query<HashMap<String, String>>,
 ) -> Response {
+    let store = &api.store;
     let (from, to) = match parse_range(&p) {
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    Json(query::span_options(&store, from, to, query::SCAN_CAP)).into_response()
+    Json(query::span_options(store, from, to, query::SCAN_CAP)).into_response()
 }
 
 async fn trace(
-    State(store): State<Arc<Store>>,
+    State(api): State<Arc<Api>>,
     Path(trace_id): Path<String>,
     Query(p): Query<HashMap<String, String>>,
 ) -> Response {
+    let store = &api.store;
     let at = match param(&p, "at") {
         Some(s) => match s.parse::<u64>() {
             Ok(v) => v,
@@ -152,7 +171,7 @@ async fn trace(
         },
         None => now_ms(),
     };
-    match query::trace(&store, &trace_id, at) {
+    match query::trace(store, &trace_id, at) {
         Ok(spans) => Json(spans).into_response(),
         Err(query::TraceError::BadId) => {
             (StatusCode::BAD_REQUEST, "invalid trace id").into_response()
@@ -163,14 +182,12 @@ async fn trace(
     }
 }
 
-async fn series(State(store): State<Arc<Store>>) -> Response {
-    Json(query::series(&store)).into_response()
+async fn series(State(api): State<Arc<Api>>) -> Response {
+    Json(query::series(&api.store)).into_response()
 }
 
-async fn points(
-    State(store): State<Arc<Store>>,
-    Query(p): Query<HashMap<String, String>>,
-) -> Response {
+async fn points(State(api): State<Arc<Api>>, Query(p): Query<HashMap<String, String>>) -> Response {
+    let store = &api.store;
     let name = param(&p, "name").unwrap_or("");
     if name.is_empty() {
         return (StatusCode::BAD_REQUEST, "missing name").into_response();
@@ -184,7 +201,7 @@ async fn points(
         Err(e) => return e.into_response(),
     };
     Json(query::points(
-        &store,
+        store,
         name,
         from,
         to,
@@ -249,7 +266,12 @@ fn index_or_placeholder() -> Response {
     }
 }
 
-async fn ui(uri: Uri) -> Response {
+async fn ui(method: Method, uri: Uri) -> Response {
+    // the SPA fallback answers reads only: an OTLP POST aimed at the wrong
+    // port must fail loudly instead of getting a 200 index.html
+    if method != Method::GET && method != Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
     let path = uri.path().trim_start_matches('/');
     if path.starts_with("api/") {
         return (StatusCode::NOT_FOUND, "no such api route").into_response();

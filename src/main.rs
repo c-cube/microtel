@@ -16,9 +16,15 @@ struct Cli {
     /// Path to YAML config (default: microtel.yaml if present)
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Override listen address
+    /// Override ingest listen address
     #[arg(long)]
     listen: Option<String>,
+    /// Override UI listen address
+    #[arg(long)]
+    ui_listen: Option<String>,
+    /// Disable the UI/API endpoint
+    #[arg(long, conflicts_with = "ui_listen")]
+    no_ui: bool,
     /// Override storage directory
     #[arg(long)]
     storage_dir: Option<PathBuf>,
@@ -33,8 +39,8 @@ struct Cli {
 enum Cmd {
     /// Exit 0 iff a running microtel's /health endpoint answers HTTP 200.
     Healthcheck {
-        /// host:port to probe
-        #[arg(long, default_value = "127.0.0.1:4318")]
+        /// host:port to probe (the UI endpoint, which serves /health)
+        #[arg(long, default_value = "127.0.0.1:8096")]
         addr: String,
     },
 }
@@ -45,7 +51,14 @@ fn main() -> Result<()> {
         std::process::exit(healthcheck(&addr));
     }
     logging::init();
-    let cfg = config::load(cli.config, cli.listen, cli.storage_dir, cli.ttl_days)?;
+    let cfg = config::load(
+        cli.config,
+        cli.listen,
+        cli.ui_listen,
+        cli.no_ui,
+        cli.storage_dir,
+        cli.ttl_days,
+    )?;
     tokio::runtime::Runtime::new()?.block_on(tokio_run(cfg))
 }
 
@@ -81,20 +94,38 @@ async fn tokio_run(cfg: config::Config) -> Result<()> {
         cfg.ttl_days,
         cfg.purge_interval_secs,
     ));
-    let listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
-    log::info!("listening on {}", listener.local_addr()?);
+    let ingest_listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    let ui_listener = match &cfg.ui {
+        Some(ui) => Some(tokio::net::TcpListener::bind(&ui.listen).await?),
+        None => None,
+    };
+    log::info!("listening on {}", ingest_listener.local_addr()?);
+    if let Some(l) = &ui_listener {
+        log::info!("ui listening on {}", l.local_addr()?);
+    }
     log::info!("storage: {}", cfg.storage_dir.display());
-    axum::serve(
-        listener,
-        ingest::router(app.clone()).merge(api::router(store.clone())),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
-    drop(app);
+    let ingest = serve(ingest_listener, ingest::router(app));
+    let ui = ui_listener.map(|l| serve(l, api::router(Arc::new(api::Api { store, stats }))));
+    ingest.await??;
+    if let Some(ui) = ui {
+        ui.await??;
+    }
     trace_writer.await?;
     metric_writer.await?;
     purge_handle.abort();
     Ok(())
+}
+
+/// Serves one endpoint until shutdown; boxed so both callers share a plain handle type.
+type ServeTask = tokio::task::JoinHandle<anyhow::Result<()>>;
+
+fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> ServeTask {
+    tokio::spawn(Box::pin(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(anyhow::Error::from)
+    }))
 }
 
 async fn shutdown_signal() {

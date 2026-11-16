@@ -21,7 +21,7 @@ fn run(args: &[&str], cwd: Option<&Path>) -> std::process::ExitStatus {
     cmd.status().expect("microtel spawns")
 }
 
-fn listening_addr(args: &[&str]) -> String {
+fn listening_addrs(args: &[&str], want_ui: bool) -> (String, Option<String>) {
     let exe = env!("CARGO_BIN_EXE_microtel");
     let mut child = Command::new(exe)
         .args(args)
@@ -31,11 +31,16 @@ fn listening_addr(args: &[&str]) -> String {
         .expect("microtel spawns");
     let stderr = child.stderr.take().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let mut addr = None;
+    let mut ingest = None;
+    let mut ui = None;
     for line in std::io::BufReader::new(stderr).lines() {
         let Ok(line) = line else { break };
-        if let Some(a) = line.split("listening on ").nth(1) {
-            addr = Some(a.trim().to_string());
+        if let Some(a) = line.split("ui listening on ").nth(1) {
+            ui = Some(a.trim().to_string());
+        } else if let Some(a) = line.split("listening on ").nth(1) {
+            ingest = Some(a.trim().to_string());
+        }
+        if ingest.is_some() && (ui.is_some() || !want_ui) {
             break;
         }
         if Instant::now() >= deadline {
@@ -44,7 +49,11 @@ fn listening_addr(args: &[&str]) -> String {
     }
     let _ = child.kill();
     let _ = child.wait();
-    addr.expect("server reported its address")
+    (ingest.expect("server reported its address"), ui)
+}
+
+fn listening_addr(args: &[&str]) -> String {
+    listening_addrs(args, false).0
 }
 
 fn write_yaml(dir: &Path, body: &str) -> PathBuf {
@@ -156,4 +165,153 @@ fn storage_dir_on_a_file_is_a_startup_error() {
         !status.success(),
         "storage_dir pointing at a file must fail"
     );
+}
+
+#[test]
+fn default_ui_port_and_healthcheck_target() {
+    let dir = repo_tmp().join("cfg-ui-default");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let exe = env!("CARGO_BIN_EXE_microtel");
+    let mut child = Command::new(exe)
+        .args([
+            "--storage-dir",
+            data.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("microtel spawns");
+    let mut ui = None;
+    for line in std::io::BufReader::new(child.stderr.take().unwrap()).lines() {
+        let Ok(line) = line else { break };
+        if let Some(a) = line.split("ui listening on ").nth(1) {
+            ui = Some(a.trim().to_string());
+            break;
+        }
+    }
+    assert_eq!(
+        ui.as_deref(),
+        Some("127.0.0.1:8096"),
+        "documented default UI port"
+    );
+    let status = run(&["healthcheck"], None);
+    assert!(
+        status.success(),
+        "bare healthcheck must probe the default UI port"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn cli_ui_listen_beats_yaml() {
+    let dir = repo_tmp().join("cfg-ui-flag");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let cfg = write_yaml(
+        &dir,
+        "listen: 127.0.0.1:19871\nui:\n  listen: 127.0.0.1:19881\n",
+    );
+    let (ingest, ui) = listening_addrs(
+        &[
+            "--config",
+            cfg.to_str().unwrap(),
+            "--storage-dir",
+            data.to_str().unwrap(),
+            "--ui-listen",
+            "127.0.0.1:19882",
+        ],
+        true,
+    );
+    assert_eq!(ingest, "127.0.0.1:19871", "yaml listen must stay in force");
+    assert_eq!(
+        ui.as_deref(),
+        Some("127.0.0.1:19882"),
+        "CLI --ui-listen must beat the yaml value"
+    );
+}
+
+#[test]
+fn no_ui_flag_disables_the_ui_endpoint() {
+    let dir = repo_tmp().join("cfg-no-ui");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let cfg = write_yaml(&dir, "ui:\n  listen: 127.0.0.1:19883\n");
+    let (_ingest, ui) = listening_addrs(
+        &[
+            "--config",
+            cfg.to_str().unwrap(),
+            "--storage-dir",
+            data.to_str().unwrap(),
+            "--no-ui",
+        ],
+        false,
+    );
+    assert_eq!(ui, None, "--no-ui must not bind the UI endpoint");
+    // both binds happen before any log line, so the port state is already final
+    assert!(
+        std::net::TcpStream::connect("127.0.0.1:19883").is_err(),
+        "UI port must stay closed under --no-ui"
+    );
+}
+
+#[test]
+fn unbindable_ui_listen_is_a_startup_error() {
+    let dir = repo_tmp().join("cfg-ui-listen");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let status = run(
+        &[
+            "--storage-dir",
+            data.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--ui-listen",
+            "not-an-address",
+        ],
+        None,
+    );
+    assert!(
+        !status.success(),
+        "garbage ui listen address must fail startup"
+    );
+}
+
+#[test]
+fn endpoints_do_not_overlap() {
+    let dir = repo_tmp().join("cfg-endpoints");
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let (mut child, ingest, ui) = common::spawn_server(&data, None);
+    let status_of = |url: String| match ureq::get(&url).call() {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => panic!("request {url} failed: {e}"),
+    };
+    assert_eq!(status_of(format!("http://{ingest}/health")), 404);
+    assert_eq!(status_of(format!("http://{ingest}/stats")), 404);
+    assert_eq!(status_of(format!("http://{ingest}/")), 404);
+    assert_eq!(
+        status_of(format!("http://{ingest}/api/metrics/series")),
+        404
+    );
+    assert_eq!(status_of(format!("http://{ui}/health")), 200);
+    assert_eq!(status_of(format!("http://{ui}/stats")), 200);
+    // OTLP aimed at the UI port must not be swallowed by the SPA fallback
+    let code = match ureq::post(&format!("http://{ui}/v1/traces")).send_string("") {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(code, _)) => code,
+        Err(e) => panic!("post failed: {e}"),
+    };
+    assert_eq!(code, 405);
+    child.kill().expect("kill server");
+    child.wait().expect("wait for server");
 }

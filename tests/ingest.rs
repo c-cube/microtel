@@ -24,7 +24,7 @@ fn ingest_roundtrip() {
         .tempdir_in(&repo_tmp)
         .unwrap();
     let data_dir = dir.path().join("data");
-    let (mut child, addr) = common::spawn_server(&data_dir, None);
+    let (mut child, addr, _ui) = common::spawn_server(&data_dir, None);
     let base = format!("http://{addr}");
     let agent = test_agent();
     let pb = "application/x-protobuf";
@@ -238,7 +238,7 @@ fn protocol_edges() {
         .tempdir_in(&repo_tmp)
         .unwrap();
     let data_dir = dir.path().join("data");
-    let (mut child, addr) = common::spawn_server(&data_dir, None);
+    let (mut child, addr, _ui) = common::spawn_server(&data_dir, None);
     let base = format!("http://{addr}");
     let agent = test_agent();
     let t0 = common::now_ns();
@@ -395,7 +395,7 @@ fn flushed_data_survives_a_sigkill() {
         .tempdir_in(&repo_tmp)
         .unwrap();
     let data_dir = dir.path().join("data");
-    let (mut child, addr) = common::spawn_server(&data_dir, None);
+    let (mut child, addr, _ui) = common::spawn_server(&data_dir, None);
     let base = format!("http://{addr}");
     let agent = test_agent();
     let req = common::trace_request(vec![common::span(
@@ -432,7 +432,7 @@ fn backpressure_429_when_the_queue_is_saturated() {
         "listen: 127.0.0.1:0\nqueue:\n  capacity: 4\n  watermark: 100\n  flush_ms: 2000\n",
     )
     .unwrap();
-    let (mut child, addr) = common::spawn_server(&data_dir, Some(&cfg_path));
+    let (mut child, addr, _ui) = common::spawn_server(&data_dir, Some(&cfg_path));
     let base = format!("http://{addr}");
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))

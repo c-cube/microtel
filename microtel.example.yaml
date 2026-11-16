@@ -1,5 +1,7 @@
 storage_dir: ./data
-listen: 127.0.0.1:4318
+listen: 127.0.0.1:4318       # OTLP ingestion
+ui:
+  listen: 127.0.0.1:8096     # web UI + API (/health, /stats live here too)
 ttl_days: 30
 purge_interval_secs: 86400
 queue:        # per signal: traces and metrics each get their own queue

@@ -22,7 +22,7 @@ fn purge_expired_by_ttl() {
         "listen: 127.0.0.1:0\nttl_days: 1\npurge_interval_secs: 1\n",
     )
     .unwrap();
-    let (mut child, addr) = common::spawn_server(&data_dir, Some(&cfg_path));
+    let (mut child, addr, _ui) = common::spawn_server(&data_dir, Some(&cfg_path));
     let base = format!("http://{addr}");
 
     let post_trace = |req: Vec<u8>| -> u16 {

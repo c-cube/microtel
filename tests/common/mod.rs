@@ -129,7 +129,7 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String) {
+pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String, String) {
     let exe = env!("CARGO_BIN_EXE_microtel");
     let mut cmd = Command::new(exe);
     cmd.arg("--storage-dir").arg(data_dir.to_str().unwrap());
@@ -138,6 +138,7 @@ pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String) {
     } else {
         cmd.arg("--listen").arg("127.0.0.1:0");
     }
+    cmd.arg("--ui-listen").arg("127.0.0.1:0");
     let mut child = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
@@ -146,7 +147,8 @@ pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String) {
     let stderr = child.stderr.take().expect("piped stderr");
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut reader = std::io::BufReader::new(stderr);
-    let mut addr: Option<String> = None;
+    let mut ingest_addr: Option<String> = None;
+    let mut ui_addr: Option<String> = None;
     let mut seen = String::new();
     let mut line = String::new();
     loop {
@@ -155,8 +157,12 @@ pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String) {
             break;
         }
         seen.push_str(&line);
-        if let Some(a) = line.split("listening on ").nth(1) {
-            addr = Some(a.trim().to_string());
+        if let Some(a) = line.split("ui listening on ").nth(1) {
+            ui_addr = Some(a.trim().to_string());
+        } else if let Some(a) = line.split("listening on ").nth(1) {
+            ingest_addr = Some(a.trim().to_string());
+        }
+        if ingest_addr.is_some() && ui_addr.is_some() {
             break;
         }
         if Instant::now() >= deadline {
@@ -169,11 +175,11 @@ pub fn spawn_server(data_dir: &Path, config: Option<&Path>) -> (Child, String) {
             eprintln!("{line}");
         }
     });
-    let Some(addr) = addr else {
+    let (Some(ingest_addr), Some(ui_addr)) = (ingest_addr, ui_addr) else {
         let _ = child.wait();
-        panic!("server did not report its address; stderr:\n{seen}");
+        panic!("server did not report both addresses; stderr:\n{seen}");
     };
-    (child, addr)
+    (child, ingest_addr, ui_addr)
 }
 
 pub fn terminate(child: &mut Child) -> std::process::ExitStatus {
