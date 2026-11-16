@@ -28,9 +28,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/microtel /usr/local/bin/microtel
-EXPOSE 4318
+EXPOSE 4318 8096
 VOLUME /data
 ENTRYPOINT ["microtel"]
-CMD ["--listen", "0.0.0.0:4318", "--storage-dir", "/data"]
+CMD ["--listen", "0.0.0.0:4318", "--ui-listen", "0.0.0.0:8096", "--storage-dir", "/data"]
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD ["microtel", "healthcheck"]

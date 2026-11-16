@@ -4,13 +4,16 @@
 #   tools/ui-check.sh [seconds]      # default 60s per page
 #
 # Env: BOMBADIL (default: bombadil), CHROME (chromium binary if it is not in a
-# standard location), PORT (default 19418), MICROTEL (default target/debug/microtel).
+# standard location), PORT (ingest, default 19418), UI_PORT (default 19419),
+# MICROTEL (default target/debug/microtel).
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 seconds=${1:-60}
 port=${PORT:-19418}
-origin="http://127.0.0.1:$port"
+uiport=${UI_PORT:-19419}
+origin="http://127.0.0.1:$uiport"
+emit="http://127.0.0.1:$port"
 bombadil=${BOMBADIL:-bombadil}
 microtel=${MICROTEL:-$root/target/debug/microtel}
 work=$(mktemp -d "${TMPDIR:-/tmp}/microtel-ui-check.XXXXXX")
@@ -32,14 +35,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$microtel" --listen "127.0.0.1:$port" --storage-dir "$work/data" >"$work/server.log" 2>&1 &
+"$microtel" --listen "127.0.0.1:$port" --ui-listen "127.0.0.1:$uiport" \
+	--storage-dir "$work/data" >"$work/server.log" 2>&1 &
 server=$!
 for _ in $(seq 1 100); do
 	curl -fsS "$origin/health" >/dev/null 2>&1 && break
 	sleep 0.1
 done
 
-(cd "$root/tools" && EMIT_ENDPOINT="$origin" node seed.mjs >/dev/null)
+(cd "$root/tools" && EMIT_ENDPOINT="$emit" node seed.mjs >/dev/null)
 
 # wait for the ingest queue to flush before asking for an exemplar
 trace=""

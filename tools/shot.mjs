@@ -1,6 +1,6 @@
 // Screenshot a page with headless chromium.
 //
-//   node shot.mjs http://127.0.0.1:4318/spans out.png [--width=1440] [--height=900]
+//   node shot.mjs http://127.0.0.1:8096/spans out.png [--width=1440] [--height=900]
 //                 [--scale=2] [--full] [--click=".chip"]
 //
 // Needs chromium: `playwright install chromium` (see README).
