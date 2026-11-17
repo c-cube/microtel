@@ -2,9 +2,12 @@ mod common;
 
 use common::*;
 use microtel::keys;
-use microtel::proto::{AttrSet, MetricKind, NumberDataPoint, Resource, SpanEnvelope, hash16};
+use microtel::proto::{
+    AttrSet, ExponentialHistogramDataPoint, HistogramDataPoint, MetricKind, NumberDataPoint,
+    Resource, SpanEnvelope, hash16,
+};
 use microtel::query::{self, GroupBy, GroupDimension};
-use microtel::store::{MetricBatch, PointRow, SeriesRow, SpanBatch, SpanRow, Store};
+use microtel::store::{HistRow, MetricBatch, PointRow, SeriesRow, SpanBatch, SpanRow, Store};
 use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::metrics::v1 as otel_metrics;
 use opentelemetry_proto::tonic::trace::v1::Span;
@@ -898,4 +901,354 @@ fn bucket_count_is_client_driven_and_capped() {
         Some(1),
     );
     assert!(coarse.buckets[0].len() <= 12);
+}
+
+fn series_row_res(
+    name: &str,
+    kind: MetricKind,
+    temporality: i32,
+    hash: [u8; 16],
+    rh: [u8; 16],
+) -> SeriesRow {
+    SeriesRow {
+        name: name.into(),
+        attr_hash: hash,
+        value: AttrSet {
+            attributes: Vec::new(),
+            kind: kind as i32,
+            resource_hash: rh.to_vec(),
+            temporality,
+        }
+        .encode_to_vec(),
+    }
+}
+
+fn hist_dp(time_ns: u64, counts: &[u64], bounds: &[f64]) -> Vec<u8> {
+    HistogramDataPoint {
+        time_unix_nano: time_ns,
+        bucket_counts: counts.to_vec(),
+        explicit_bounds: bounds.to_vec(),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+fn hist_row(name: &str, hash: [u8; 16], time_ns: u64, counts: &[u64], bounds: &[f64]) -> HistRow {
+    HistRow {
+        name: name.into(),
+        attr_hash: hash,
+        ymd: keys::ymd(time_ns),
+        time_ns,
+        value: hist_dp(time_ns, counts, bounds),
+    }
+}
+
+fn expo_dp(time_ns: u64, scale: i32, zero_count: u64, offset: i32, counts: &[u64]) -> Vec<u8> {
+    ExponentialHistogramDataPoint {
+        time_unix_nano: time_ns,
+        scale,
+        zero_count,
+        zero_threshold: 0.5,
+        positive: Some(otel_metrics::exponential_histogram_data_point::Buckets {
+            offset,
+            bucket_counts: counts.to_vec(),
+        }),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+fn expo_row(
+    name: &str,
+    hash: [u8; 16],
+    time_ns: u64,
+    scale: i32,
+    zero: u64,
+    offset: i32,
+    counts: &[u64],
+) -> HistRow {
+    HistRow {
+        name: name.into(),
+        attr_hash: hash,
+        ymd: keys::ymd(time_ns),
+        time_ns,
+        value: expo_dp(time_ns, scale, zero, offset, counts),
+    }
+}
+
+fn metric_batch_res(
+    resources: Vec<([u8; 16], Resource)>,
+    series: Vec<SeriesRow>,
+    points: Vec<PointRow>,
+    histograms: Vec<HistRow>,
+) -> MetricBatch {
+    MetricBatch {
+        resources: resources
+            .into_iter()
+            .map(|(h, r)| (h, r.encode_to_vec()))
+            .collect(),
+        series,
+        points,
+        histograms,
+    }
+}
+
+#[test]
+fn series_resolves_service_from_resource() {
+    let (_dir, store) = store();
+    let (ra, res_a) = res("svc-a");
+    let (rb, res_b) = res("svc-b");
+    let ha = attr_hash("svc-a");
+    store
+        .apply_metrics(&metric_batch_res(
+            vec![(ra, res_a), (rb, res_b)],
+            vec![
+                // resource-attributed: no service.name in datapoint attrs
+                series_row_res("checkout", MetricKind::Histogram, 2, ha, ra),
+                // legacy: empty resource hash falls back to datapoint attrs
+                series_row("legacy", "svc-b", MetricKind::Gauge, rb),
+            ],
+            Vec::new(),
+            Vec::new(),
+        ))
+        .unwrap();
+
+    let list = query::series(&store);
+    assert_eq!(list.len(), 2);
+    let by_name = |name: &str| list.iter().find(|s| s.name == name).unwrap();
+    assert_eq!(by_name("checkout").service, "svc-a");
+    assert_eq!(by_name("checkout").kind, "histogram");
+    assert_eq!(by_name("legacy").service, "svc-b");
+    assert_eq!(by_name("legacy").kind, "gauge");
+}
+
+#[test]
+fn points_and_heatmap_filter_by_resource_service() {
+    let (_dir, store) = store();
+    let (ra, res_a) = res("svc-a");
+    let (rb, res_b) = res("svc-b");
+    let ha = attr_hash("svc-a");
+    let hb = attr_hash("svc-b");
+    store
+        .apply_metrics(&metric_batch_res(
+            vec![(ra, res_a), (rb, res_b)],
+            vec![
+                series_row_res("lat", MetricKind::Histogram, 2, ha, ra),
+                series_row_res("lat", MetricKind::Histogram, 2, hb, rb),
+            ],
+            Vec::new(),
+            vec![
+                hist_row("lat", ha, ns(BASE_MS, 0), &[2, 1], &[10.0]),
+                hist_row("lat", hb, ns(BASE_MS, 0), &[9, 1], &[10.0]),
+            ],
+        ))
+        .unwrap();
+
+    let heat = query::heatmap(
+        &store,
+        "lat",
+        BASE_MS,
+        BASE_MS + 60_000,
+        &["svc-a".into()],
+        query::SCAN_CAP,
+        None,
+    );
+    let total: f64 = heat.counts.iter().map(|row| row.iter().sum::<f64>()).sum();
+    assert_eq!(total, 3.0);
+    let heat = query::heatmap(
+        &store,
+        "lat",
+        BASE_MS,
+        BASE_MS + 60_000,
+        &[],
+        query::SCAN_CAP,
+        None,
+    );
+    let total: f64 = heat.counts.iter().map(|row| row.iter().sum::<f64>()).sum();
+    assert_eq!(total, 13.0, "no filter sums every series");
+}
+
+#[test]
+fn heatmap_deltas_cumulative_and_resets() {
+    let (_dir, store) = store();
+    let h = attr_hash("svc-a");
+    store
+        .apply_metrics(&metric_batch_res(
+            Vec::new(),
+            vec![series_row_res("dur", MetricKind::Histogram, 2, h, [0; 16])],
+            Vec::new(),
+            vec![
+                hist_row("dur", h, ns(BASE_MS, 0), &[5, 3, 1], &[10.0, 100.0]),
+                hist_row("dur", h, ns(BASE_MS, 60_000), &[7, 6, 1], &[10.0, 100.0]),
+                // count decrease in the middle bucket => reset => raw counts
+                hist_row("dur", h, ns(BASE_MS, 120_000), &[8, 4, 2], &[10.0, 100.0]),
+            ],
+        ))
+        .unwrap();
+
+    let heat = query::heatmap(
+        &store,
+        "dur",
+        BASE_MS,
+        BASE_MS + 180_000,
+        &[],
+        query::SCAN_CAP,
+        None,
+    );
+    assert_eq!(heat.bounds, vec![10.0, 100.0]);
+    let nonempty: Vec<(usize, Vec<f64>)> = heat
+        .counts
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            (
+                r,
+                row.iter()
+                    .filter(|c| **c > 0.0)
+                    .cloned()
+                    .collect::<Vec<f64>>(),
+            )
+        })
+        .filter(|(_, row)| !row.is_empty())
+        .collect();
+    // buckets are 1s wide here; the three datapoints each occupy distinct columns
+    let cols: Vec<Vec<f64>> = (0..heat.counts[0].len())
+        .map(|c| {
+            (0..heat.counts.len())
+                .map(|r| heat.counts[r][c])
+                .collect::<Vec<f64>>()
+        })
+        .filter(|col| col.iter().any(|c| *c > 0.0))
+        .collect();
+    assert_eq!(
+        cols.len(),
+        3,
+        "three datapoints in distinct buckets: {nonempty:?}"
+    );
+    assert_eq!(cols[0], vec![5.0, 3.0, 1.0]);
+    assert_eq!(cols[1], vec![2.0, 3.0, 0.0], "cumulative delta");
+    assert_eq!(cols[2], vec![8.0, 4.0, 2.0], "reset falls back to raw");
+}
+
+#[test]
+fn heatmap_newest_bounds_win_and_fold() {
+    let (_dir, store) = store();
+    let h = attr_hash("svc-a");
+    store
+        .apply_metrics(&metric_batch_res(
+            Vec::new(),
+            vec![series_row_res("dur", MetricKind::Histogram, 2, h, [0; 16])],
+            Vec::new(),
+            vec![
+                hist_row("dur", h, ns(BASE_MS, 0), &[1, 4, 1], &[10.0, 100.0]),
+                hist_row("dur", h, ns(BASE_MS, 60_000), &[2, 5, 1], &[25.0, 250.0]),
+            ],
+        ))
+        .unwrap();
+
+    let heat = query::heatmap(
+        &store,
+        "dur",
+        BASE_MS,
+        BASE_MS + 120_000,
+        &[],
+        query::SCAN_CAP,
+        None,
+    );
+    assert_eq!(
+        heat.bounds,
+        vec![25.0, 250.0],
+        "newest datapoint defines rows"
+    );
+    let cols: Vec<Vec<f64>> = (0..heat.counts[0].len())
+        .map(|c| {
+            (0..heat.counts.len())
+                .map(|r| heat.counts[r][c])
+                .collect::<Vec<f64>>()
+        })
+        .filter(|col| col.iter().any(|c| *c > 0.0))
+        .collect();
+    assert_eq!(cols.len(), 2);
+    // older shape folds onto the new rows: (10,100] midpoint 55 lands in
+    // (25,250]; the over-bounds bucket anchors at its bound 100, same row
+    assert_eq!(cols[0], vec![1.0, 5.0, 0.0]);
+    assert_eq!(cols[1], vec![1.0, 1.0, 0.0], "shape change still deltas");
+}
+
+#[test]
+fn heatmap_exponential_rows() {
+    let (_dir, store) = store();
+    let h = attr_hash("svc-a");
+    store
+        .apply_metrics(&metric_batch_res(
+            Vec::new(),
+            vec![series_row_res(
+                "expo",
+                MetricKind::ExponentialHistogram,
+                2,
+                h,
+                [0; 16],
+            )],
+            Vec::new(),
+            vec![expo_row("expo", h, ns(BASE_MS, 0), 1, 2, -1, &[4, 6])],
+        ))
+        .unwrap();
+
+    let heat = query::heatmap(
+        &store,
+        "expo",
+        BASE_MS,
+        BASE_MS + 60_000,
+        &[],
+        query::SCAN_CAP,
+        None,
+    );
+    // base = sqrt(2): positive buckets (-1: (0.5,0.707], 0: (0.707,1]), zero bucket ±0.5
+    assert_eq!(
+        heat.bounds,
+        vec![-0.5, 0.5, std::f64::consts::FRAC_1_SQRT_2, 1.0]
+    );
+    let col: Vec<f64> = (0..heat.counts.len()).map(|r| heat.counts[r][0]).collect();
+    assert_eq!(col, vec![0.0, 2.0, 4.0, 6.0, 0.0]);
+}
+
+#[test]
+fn heatmap_delta_temporality_used_raw() {
+    let (_dir, store) = store();
+    let h = attr_hash("svc-a");
+    store
+        .apply_metrics(&metric_batch_res(
+            Vec::new(),
+            vec![series_row_res("dur", MetricKind::Histogram, 1, h, [0; 16])],
+            Vec::new(),
+            vec![
+                hist_row("dur", h, ns(BASE_MS, 0), &[5, 1], &[10.0]),
+                hist_row("dur", h, ns(BASE_MS, 60_000), &[7, 1], &[10.0]),
+            ],
+        ))
+        .unwrap();
+
+    let heat = query::heatmap(
+        &store,
+        "dur",
+        BASE_MS,
+        BASE_MS + 120_000,
+        &[],
+        query::SCAN_CAP,
+        None,
+    );
+    let cols: Vec<Vec<f64>> = (0..heat.counts[0].len())
+        .map(|c| {
+            (0..heat.counts.len())
+                .map(|r| heat.counts[r][c])
+                .collect::<Vec<f64>>()
+        })
+        .filter(|col| col.iter().any(|c| *c > 0.0))
+        .collect();
+    assert_eq!(cols[0], vec![5.0, 1.0]);
+    assert_eq!(
+        cols[1],
+        vec![7.0, 1.0],
+        "delta histograms are not re-differenced"
+    );
 }

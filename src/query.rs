@@ -12,8 +12,13 @@ use serde::Serialize;
 use time::{Date, Month};
 
 use crate::keys::{self, HASH_LEN, TRACE_ID_LEN};
-use crate::proto::{AttrSet, MetricKind, NumberDataPoint, SpanEnvelope};
-use crate::store::{CF_POINTS, CF_RESOURCES, CF_SERIES, CF_SPAN_TIME, CF_SPAN_TRACE, Store};
+use crate::proto::{
+    AttrSet, ExponentialHistogramDataPoint, HistogramDataPoint, MetricKind, NumberDataPoint,
+    SpanEnvelope, Temporality,
+};
+use crate::store::{
+    CF_HISTOGRAMS, CF_POINTS, CF_RESOURCES, CF_SERIES, CF_SPAN_TIME, CF_SPAN_TRACE, Store,
+};
 
 /// Live-server scan bounds; tests pass a smaller cap.
 pub const SCAN_CAP: usize = 50_000;
@@ -145,6 +150,9 @@ pub struct SpanOptions {
 pub struct SeriesInfo {
     pub name: String,
     pub attrs: BTreeMap<String, String>,
+    pub service: String,
+    /// Lowercase metric kind: "gauge", "sum", "histogram" or "exponential_histogram".
+    pub kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -319,6 +327,30 @@ fn service_of(store: &Store, resource_hash: &[u8]) -> Option<String> {
             any_value::Value::StringValue(s) => Some(s.clone()),
             _ => None,
         })
+}
+
+/// Service behind a series: its resource when stored, else the attrs
+/// (legacy rows predate resource attribution), else `unknown`.
+fn series_service(store: &Store, set: &AttrSet, attrs: &BTreeMap<String, String>) -> String {
+    if !set.resource_hash.is_empty()
+        && let Some(svc) = service_of(store, &set.resource_hash)
+    {
+        return svc;
+    }
+    attrs
+        .get("service.name")
+        .cloned()
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn kind_str(kind: MetricKind) -> &'static str {
+    match kind {
+        MetricKind::Gauge => "gauge",
+        MetricKind::Sum => "sum",
+        MetricKind::Histogram => "histogram",
+        MetricKind::ExponentialHistogram => "exponential_histogram",
+        MetricKind::Unspecified => "unspecified",
+    }
 }
 
 fn load_resource_attrs(store: &Store, resource_hash: &[u8]) -> BTreeMap<String, String> {
@@ -647,9 +679,13 @@ pub fn series(store: &Store) -> Vec<SeriesInfo> {
             let (len, n) = keys::read_varint(&key)?;
             let name = String::from_utf8(key[n..n + len as usize].to_vec()).ok()?;
             let set = AttrSet::decode(&value[..]).ok()?;
+            let attrs = attr_map(&set.attributes);
+            let kind = MetricKind::try_from(set.kind).unwrap_or(MetricKind::Unspecified);
             Some(SeriesInfo {
                 name,
-                attrs: attr_map(&set.attributes),
+                service: series_service(store, &set, &attrs),
+                kind: kind_str(kind),
+                attrs,
             })
         })
         .collect();
@@ -732,9 +768,9 @@ pub fn points(
                     .flatten()
                     .and_then(|v| AttrSet::decode(v.as_slice()).ok());
                 let attrs = set.as_ref().map(|s| attr_map(&s.attributes));
-                let svc = attrs
+                let svc = set
                     .as_ref()
-                    .and_then(|a| a.get("service.name").cloned())
+                    .map(|s| series_service(store, s, attrs.as_ref().unwrap_or(&BTreeMap::new())))
                     .unwrap_or_else(|| "unknown".into());
                 let skip = !selected.is_empty() && !selected.contains(svc.as_str());
                 e.insert(Acc {
@@ -811,6 +847,301 @@ pub fn points(
         truncated,
         t: grid(from_ms, bucket_ms, n),
         lines,
+    }
+}
+
+/// One decoded histogram datapoint: bucket intervals plus per-bucket counts.
+struct HistPoint {
+    time_ns: u64,
+    /// Bucket edges; outer buckets use `±f64::INFINITY`. `intervals.len() == counts.len()`.
+    intervals: Vec<(f64, f64)>,
+    counts: Vec<u64>,
+    exemplar: Option<[String; 2]>,
+}
+
+/// Row grid of a metric name over the scan window: interior boundaries, ascending.
+#[derive(Serialize)]
+pub struct Heatmap {
+    pub bucket_ms: u64,
+    pub truncated: bool,
+    pub t: Vec<u64>,
+    /// Rows = `bounds.len() + 1`: row 0 is `(-inf, bounds[0]]`, row i is
+    /// `(bounds[i-1], bounds[i]]`, the last is `(bounds[-1], +inf)`.
+    pub bounds: Vec<f64>,
+    /// `counts[row][col]`, summed over every series matching the filter.
+    pub counts: Vec<Vec<f64>>,
+    pub exemplars: Vec<Exemplar>,
+}
+
+/// Bucket grid from the newest datapoint in range; cumulative histograms are
+/// delta-normalized (count decrease ⇒ reset ⇒ raw counts) and every datapoint's
+/// buckets fold onto the newest row set by representative point.
+/// Per-series aggregation state for one metric name.
+struct HistoSeries {
+    temporality: Temporality,
+    kind: MetricKind,
+    /// Filtered out by the service filter.
+    skip: bool,
+    points: Vec<HistPoint>,
+}
+
+pub fn heatmap(
+    store: &Store,
+    name: &str,
+    from_ms: u64,
+    to_ms: u64,
+    svcs: &[String],
+    cap: usize,
+    buckets: Option<usize>,
+) -> Heatmap {
+    let from_ns = from_ms * 1_000_000;
+    let to_ns = to_ms * 1_000_000;
+    let bucket_ms = pick_bucket_ms_for(to_ms - from_ms, buckets);
+    let bucket_ns = bucket_ms * 1_000_000;
+    let n = usize::try_from((to_ns - from_ns).div_ceil(bucket_ns)).unwrap_or(1);
+    let first_ymd = keys::ymd(from_ns);
+    let last_ymd = keys::ymd(to_ns - 1);
+    let selected: HashSet<&str> = svcs.iter().map(String::as_str).collect();
+
+    // pass 1: decode datapoints per series, find the newest row set
+    let mut series: HashMap<[u8; HASH_LEN], HistoSeries> = HashMap::new();
+    let mut newest: Option<(u64, Vec<f64>)> = None;
+    let mut truncated = false;
+    let mut scanned = 0usize;
+    let seek = keys::point_key(name, &[0; HASH_LEN], first_ymd, from_ns);
+    'scan: for (key, value) in store.scan_from(CF_HISTOGRAMS, &seek) {
+        let Some(plen) = keys::series_prefix_len(&key) else {
+            continue;
+        };
+        let (len, off) = match keys::read_varint(&key) {
+            Some(x) => x,
+            None => continue,
+        };
+        let Ok(key_name) = std::str::from_utf8(&key[off..off + len as usize]) else {
+            continue;
+        };
+        if key_name != name {
+            break;
+        }
+        let hash: [u8; HASH_LEN] = key[plen - HASH_LEN..plen].try_into().expect("16 bytes");
+        let ymd = u32::from_be_bytes(key[plen..plen + 4].try_into().expect("4 bytes"));
+        let ts = u64::from_be_bytes(key[plen + 4..plen + 12].try_into().expect("8 bytes"));
+        if ymd > last_ymd || (ymd == last_ymd && ts >= to_ns) {
+            break;
+        }
+        if ts < from_ns {
+            continue;
+        }
+        let hs = match series.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let set = store
+                    .get(CF_SERIES, &keys::series_prefix(name, &hash))
+                    .ok()
+                    .flatten()
+                    .and_then(|v| AttrSet::decode(v.as_slice()).ok());
+                let kind = set
+                    .as_ref()
+                    .and_then(|s| MetricKind::try_from(s.kind).ok())
+                    .unwrap_or(MetricKind::Unspecified);
+                let temporality = set
+                    .as_ref()
+                    .and_then(|s| Temporality::try_from(s.temporality).ok())
+                    .unwrap_or(Temporality::Unspecified);
+                let svc = set
+                    .as_ref()
+                    .map(|s| series_service(store, s, &attr_map(&s.attributes)))
+                    .unwrap_or_else(|| "unknown".into());
+                let skip = !selected.is_empty() && !selected.contains(svc.as_str());
+                e.insert(HistoSeries {
+                    temporality,
+                    kind,
+                    skip,
+                    points: Vec::new(),
+                })
+            }
+        };
+        if hs.skip {
+            continue;
+        }
+        if scanned >= cap {
+            truncated = true;
+            break 'scan;
+        }
+        scanned += 1;
+        let point = match hs.kind {
+            MetricKind::Histogram => HistogramDataPoint::decode(&value[..])
+                .ok()
+                .map(|dp| explicit_point(&dp)),
+            MetricKind::ExponentialHistogram => ExponentialHistogramDataPoint::decode(&value[..])
+                .ok()
+                .map(|dp| exponential_point(&dp)),
+            _ => None,
+        };
+        let Some(point) = point else { continue };
+        if newest.as_ref().is_none_or(|(t, _)| point.time_ns >= *t) {
+            newest = Some((point.time_ns, interior_bounds(&point)));
+        }
+        hs.points.push(point);
+    }
+
+    // pass 2: delta-normalize each series, fold onto the newest rows
+    let Some((_, bounds)) = newest else {
+        return Heatmap {
+            bucket_ms,
+            truncated,
+            t: grid(from_ms, bucket_ms, n),
+            bounds: Vec::new(),
+            counts: Vec::new(),
+            exemplars: Vec::new(),
+        };
+    };
+    let rows = bounds.len() + 1;
+    let mut cells = vec![vec![0f64; n]; rows];
+    let mut exemplars: Vec<Exemplar> = Vec::new();
+    let mut seen_col: HashSet<usize> = HashSet::new();
+    for hs in series.values() {
+        let mut prev: Option<Vec<u64>> = None;
+        for point in &hs.points {
+            let counts = if hs.temporality == Temporality::Delta {
+                point.counts.clone()
+            } else {
+                match &prev {
+                    Some(p)
+                        if p.len() == point.counts.len()
+                            && point.counts.iter().zip(p).all(|(c, pr)| c >= pr) =>
+                    {
+                        point.counts.iter().zip(p).map(|(c, pr)| c - pr).collect()
+                    }
+                    _ => point.counts.clone(),
+                }
+            };
+            prev = Some(point.counts.clone());
+            let col = usize::try_from(point.time_ns.saturating_sub(from_ns) / bucket_ns)
+                .unwrap_or(usize::MAX);
+            if col >= n {
+                continue;
+            }
+            for (count, interval) in counts.iter().zip(&point.intervals) {
+                if *count == 0 {
+                    continue;
+                }
+                let row = row_of(&bounds, representative(interval));
+                cells[row][col] += *count as f64;
+            }
+            if let Some([trace_id, span_id]) = &point.exemplar
+                && seen_col.insert(col)
+            {
+                exemplars.push(Exemplar {
+                    t: from_ms + col as u64 * bucket_ms,
+                    label: String::new(),
+                    trace_id: trace_id.clone(),
+                    span_id: span_id.clone(),
+                });
+            }
+        }
+    }
+    exemplars.sort_by_key(|e| e.t);
+
+    Heatmap {
+        bucket_ms,
+        truncated,
+        t: grid(from_ms, bucket_ms, n),
+        bounds,
+        counts: cells,
+        exemplars,
+    }
+}
+
+/// Finite bucket edges of a datapoint, ascending: the heatmap row set.
+fn interior_bounds(point: &HistPoint) -> Vec<f64> {
+    let mut edges: Vec<f64> = Vec::new();
+    for (lo, hi) in &point.intervals {
+        for e in [lo, hi] {
+            if e.is_finite() && !edges.contains(e) {
+                edges.push(*e);
+            }
+        }
+    }
+    edges.sort_by(|a, b| a.total_cmp(b));
+    edges
+}
+
+/// Row containing `rep`: rows partition at `bounds`.
+fn row_of(bounds: &[f64], rep: f64) -> usize {
+    bounds.partition_point(|b| *b < rep)
+}
+
+/// Bucket representative value for row assignment: edge buckets anchor on their
+/// finite edge, interior buckets on the midpoint.
+fn representative(interval: &(f64, f64)) -> f64 {
+    let (lo, hi) = *interval;
+    match (lo.is_finite(), hi.is_finite()) {
+        (true, true) => (lo + hi) / 2.0,
+        (false, true) => hi,
+        // first value strictly above `lo` so the over-bounds bucket lands past the last bound
+        (true, false) => f64::from_bits(lo.to_bits() + 1),
+        (false, false) => 0.0,
+    }
+}
+
+fn exemplar_of(list: &[opentelemetry_proto::tonic::metrics::v1::Exemplar]) -> Option<[String; 2]> {
+    let ex = list.first()?;
+    if ex.trace_id.len() == TRACE_ID_LEN && ex.span_id.len() == keys::SPAN_ID_LEN {
+        Some([hex(&ex.trace_id), hex(&ex.span_id)])
+    } else {
+        None
+    }
+}
+
+fn explicit_point(dp: &HistogramDataPoint) -> HistPoint {
+    let bounds = &dp.explicit_bounds;
+    let mut intervals = Vec::with_capacity(bounds.len() + 1);
+    let mut lo = f64::NEG_INFINITY;
+    for hi in bounds {
+        intervals.push((lo, *hi));
+        lo = *hi;
+    }
+    intervals.push((lo, f64::INFINITY));
+    HistPoint {
+        time_ns: dp.time_unix_nano,
+        intervals,
+        counts: dp.bucket_counts.clone(),
+        exemplar: exemplar_of(&dp.exemplars),
+    }
+}
+
+/// Buckets to intervals per the OTLP exponential layout: `base = 2^(2^-scale)`,
+/// positive bucket `i` covers `(base^(i-1), base^i]`, negatives mirror it, and
+/// the zero bucket spans `±zero_threshold`.
+fn exponential_point(dp: &ExponentialHistogramDataPoint) -> HistPoint {
+    let exp2 = |i: i32| 2f64.powf(i as f64 * 2f64.powi(-dp.scale));
+    let mut intervals = Vec::new();
+    let mut counts = Vec::new();
+    let zt = dp.zero_threshold;
+    if let Some(b) = &dp.negative {
+        for (j, count) in b.bucket_counts.iter().enumerate() {
+            let i = b.offset + j as i32;
+            intervals.push((-exp2(i), -exp2(i - 1)));
+            counts.push(*count);
+        }
+    }
+    if dp.zero_count > 0 {
+        intervals.push((-zt, zt));
+        counts.push(dp.zero_count);
+    }
+    if let Some(b) = &dp.positive {
+        for (j, count) in b.bucket_counts.iter().enumerate() {
+            let i = b.offset + j as i32;
+            intervals.push((exp2(i - 1), exp2(i)));
+            counts.push(*count);
+        }
+    }
+    HistPoint {
+        time_ns: dp.time_unix_nano,
+        intervals,
+        counts,
+        exemplar: exemplar_of(&dp.exemplars),
     }
 }
 

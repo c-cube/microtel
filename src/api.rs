@@ -30,6 +30,7 @@ pub fn router(api: Arc<Api>) -> Router {
         .route("/api/spans/options", get(span_options))
         .route("/api/metrics/series", get(series))
         .route("/api/metrics/points", get(points))
+        .route("/api/metrics/heatmap", get(heatmap))
         .route("/api/traces/{trace_id}", get(trace))
         .route("/health", get(health))
         .route("/stats", get(stats))
@@ -202,6 +203,35 @@ async fn points(State(api): State<Arc<Api>>, Query(p): Query<HashMap<String, Str
         Err(e) => return e.into_response(),
     };
     Json(query::points(
+        store,
+        name,
+        from,
+        to,
+        &parse_services(&p),
+        query::SCAN_CAP,
+        buckets,
+    ))
+    .into_response()
+}
+
+async fn heatmap(
+    State(api): State<Arc<Api>>,
+    Query(p): Query<HashMap<String, String>>,
+) -> Response {
+    let store = &api.store;
+    let name = param(&p, "name").unwrap_or("");
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "missing name").into_response();
+    }
+    let (from, to) = match parse_range(&p) {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    let buckets = match bucket_param(&p) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    Json(query::heatmap(
         store,
         name,
         from,
