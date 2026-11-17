@@ -532,15 +532,79 @@ const baseLatency = {
 	[S.email]: 30,
 };
 
+const HIST_BOUNDS = [5, 10, 25, 50, 75, 100, 250, 500, 1000];
+const histCumulative = (name, latencyMs, t, prevCounts) => {
+	// delta counts land mostly near the service's base latency
+	const deltas = HIST_BOUNDS.map(() => 0);
+	const samples = rand(4, 12);
+	for (let s = 0; s < samples; s++) {
+		const v = latencyMs * Math.exp(gauss() * 0.45);
+		let b = HIST_BOUNDS.findIndex((bound) => v <= bound);
+		if (b === -1) b = HIST_BOUNDS.length; // over the last bound
+		deltas[b] += 1;
+	}
+	const counts = prevCounts ? prevCounts.map((c, i) => c + deltas[i]) : deltas;
+	const count = counts.reduce((a, c) => a + c, 0);
+	return {
+		point: {
+			attrs: withSvc(name),
+			timeNs: t * 1e6,
+			startNs: startMs * 1e6,
+			count,
+			sum: Math.round(count * latencyMs),
+			bounds: HIST_BOUNDS,
+			counts,
+		},
+		counts,
+	};
+};
+
+const EXPO = { scale: 2, offset: -4, len: 12 }; // buckets ~61ms..16s in x4 steps
+const expoCumulative = (name, latencyMs, t, prev) => {
+	const pos = prev ? [...prev.pos] : new Array(EXPO.len).fill(0);
+	let zeros = prev ? prev.zero : 0;
+	const samples = rand(4, 10);
+	for (let s = 0; s < samples; s++) {
+		const v = (latencyMs * Math.exp(gauss() * 0.5)) / 1000; // seconds
+		if (v <= 0.03) {
+			zeros += 1;
+			continue;
+		}
+		const idx = Math.ceil(Math.log2(v) * 2 ** EXPO.scale) - 1;
+		const j = idx - EXPO.offset;
+		if (j >= 0 && j < EXPO.len) pos[j] += 1;
+	}
+	const count = zeros + pos.reduce((a, c) => a + c, 0);
+	return {
+		point: {
+			attrs: withSvc(name),
+			timeNs: t * 1e6,
+			startNs: startMs * 1e6,
+			count,
+			sum: Math.round(count * latencyMs),
+			scale: EXPO.scale,
+			zeroCount: zeros,
+			zeroThreshold: 0.03,
+			positive: { offset: EXPO.offset, counts: pos },
+		},
+		pos,
+		zero: zeros,
+	};
+};
+
 for (const name of Object.values(S)) {
 	const requests = [];
 	const durations = [];
 	const heap = [];
 	const conns = [];
+	const hist = [];
+	let expoHist = null;
 	const declines = [];
 	let counter = 0;
 	let heapNow = rand(220, 340);
 	let connNow = rand(18, 42);
+	let histCounts = null;
+	let expo = null;
 	for (let i = 0; i < steps; i++) {
 		const t = startMs + i * step;
 		counter +=
@@ -568,6 +632,14 @@ for (const name of Object.values(S)) {
 			timeNs: t * 1e6,
 			value: Math.round(connNow),
 		});
+		const h = histCumulative(name, baseLatency[name], t, histCounts);
+		histCounts = h.counts;
+		hist.push(h.point);
+		if (name === S.web) {
+			const e = expoCumulative(name, baseLatency[name] * 4, t, expo);
+			expo = { pos: e.pos, zero: e.zero };
+			expoHist.push(e.point);
+		}
 		if (name === S.payment) {
 			declines.push({
 				attrs: withSvc(name, { "error.type": "card_declined" }),
@@ -606,6 +678,18 @@ for (const name of Object.values(S)) {
 									description: "Declined charges",
 								}),
 							]
+						: []),
+					metric("checkout.duration", "histogram", hist, {
+						unit: "ms",
+						description: "End to end checkout latency",
+					}),
+					...(name === S.web && expoHist
+						? [
+								metric("browser.render", "exponential", expoHist, {
+									unit: "s",
+									description: "Render completion",
+								}),
+						]
 						: []),
 				],
 			},

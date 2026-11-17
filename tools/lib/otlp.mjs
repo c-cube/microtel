@@ -28,9 +28,21 @@ export const double = (field, v) => {
 };
 export const fixed64 = (field, v) => {
 	const b = Buffer.alloc(8);
-	b.writeBigUInt64LE(BigInt(v));
+	b.writeBigUInt64LE(BigInt(Math.round(v)) & 0xffffffffffffffffn);
 	return concat([tag(field, 1), b]);
 };
+const raw64 = (v) => {
+	const b = Buffer.alloc(8);
+	b.writeBigUInt64LE(BigInt(Math.max(0, Math.round(v))) & 0xffffffffffffffffn);
+	return b;
+};
+const rawDouble = (v) => {
+	const b = Buffer.alloc(8);
+	b.writeDoubleLE(v);
+	return b;
+};
+// sint32: zigzag varint
+const sint = (field, v) => uint(field, v >= 0 ? 2n * BigInt(v) : -2n * BigInt(v) - 1n);
 
 // --- common ---
 
@@ -131,22 +143,69 @@ export const metric = (
 	points,
 	{ unit = "", description = "" } = {},
 ) => {
-	const dps = points.map((p) =>
-		bytes(
-			1,
-			concat([
-				p.startNs != null ? fixed64(2, p.startNs) : Buffer.alloc(0),
-				fixed64(3, p.timeNs),
-				double(4, p.value),
-				...Object.entries(p.attrs).map(([k, v]) => bytes(7, kv(k, v))),
-			]),
-		),
-	);
-	const body = concat(dps);
-	const data =
-		kind === "sum"
-			? bytes(7, concat([body, uint(2, 2), uint(3, 1)])) // cumulative, monotonic
-			: bytes(5, body);
+	let data;
+	if (kind === "histogram") {
+		// points: { timeNs, startNs?, count, sum?, bounds, counts, attrs? } (cumulative)
+		const dps = points.map((p) =>
+			bytes(
+				1,
+				concat([
+					p.startNs != null ? fixed64(2, p.startNs) : Buffer.alloc(0),
+					fixed64(3, p.timeNs),
+					fixed64(4, p.count),
+					p.sum != null ? double(5, p.sum) : Buffer.alloc(0),
+					bytes(6, concat(p.counts.map(raw64))),
+					bytes(7, concat(p.bounds.map(rawDouble))),
+					...Object.entries(p.attrs ?? {}).map(([k, v]) => bytes(9, kv(k, v))),
+				]),
+			),
+		);
+		data = bytes(9, concat([concat(dps), uint(2, 2)]));
+	} else if (kind === "exponential") {
+		// points: { timeNs, startNs?, count, sum?, scale, zeroCount?, zeroThreshold?,
+		//           positive?: { offset, counts }, negative?: { offset, counts }, attrs? } (cumulative)
+		const buckets = (field, b) =>
+			b
+				? bytes(
+						field,
+						concat([sint(1, b.offset), bytes(2, concat(b.counts.map(raw64)))]),
+				  )
+				: Buffer.alloc(0);
+		const dps = points.map((p) =>
+			bytes(
+				1,
+				concat([
+					p.startNs != null ? fixed64(2, p.startNs) : Buffer.alloc(0),
+					fixed64(3, p.timeNs),
+					fixed64(4, p.count),
+					p.sum != null ? double(5, p.sum) : Buffer.alloc(0),
+					sint(6, p.scale),
+					fixed64(7, p.zeroCount ?? 0),
+					buckets(8, p.positive),
+					buckets(9, p.negative),
+					double(14, p.zeroThreshold ?? 0),
+					...Object.entries(p.attrs ?? {}).map(([k, v]) => bytes(1, kv(k, v))),
+				]),
+			),
+		);
+		data = bytes(10, concat([concat(dps), uint(2, 2)]));
+	} else {
+		const dps = points.map((p) =>
+			bytes(
+				1,
+				concat([
+					p.startNs != null ? fixed64(2, p.startNs) : Buffer.alloc(0),
+					fixed64(3, p.timeNs),
+					double(4, p.value),
+					...Object.entries(p.attrs).map(([k, v]) => bytes(7, kv(k, v))),
+				]),
+			),
+		);
+		data =
+			kind === "sum"
+				? bytes(7, concat([body(dps), uint(2, 2), uint(3, 1)])) // cumulative, monotonic
+				: bytes(5, body(dps));
+	}
 	return concat([
 		str(1, name),
 		description ? str(2, description) : Buffer.alloc(0),
@@ -154,6 +213,8 @@ export const metric = (
 		data,
 	]);
 };
+
+const body = (dps) => concat(dps);
 
 /** Resources: [{ attrs, metrics: [metricBytes] }] */
 export const metricsRequest = (resources) =>
