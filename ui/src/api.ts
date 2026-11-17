@@ -26,6 +26,9 @@ export interface Barchart {
 export interface SeriesInfo {
   name: string;
   attrs: Record<string, string>;
+  service: string;
+  /** "gauge" | "sum" | "histogram" | "exponential_histogram" */
+  kind: string;
 }
 
 export interface Line {
@@ -38,6 +41,24 @@ export interface Points {
   truncated: boolean;
   t: number[];
   lines: Line[];
+}
+
+export interface HeatExemplar {
+  t: number;
+  label: string;
+  trace_id: string;
+  span_id: string;
+}
+
+export interface Heatmap {
+  bucket_ms: number;
+  truncated: boolean;
+  t: number[];
+  /** Interior row boundaries, ascending; rows = bounds.length + 1. */
+  bounds: number[];
+  /** counts[row][col] */
+  counts: number[][];
+  exemplars: HeatExemplar[];
 }
 
 const json = async <T,>(r: Response): Promise<T> => {
@@ -56,6 +77,9 @@ export const series = () =>
 
 export const points = (q: string) =>
   fetch(`/api/metrics/points?${q}`).then((r) => json<Points>(r));
+
+export const heatmap = (q: string) =>
+  fetch(`/api/metrics/heatmap?${q}`).then((r) => json<Heatmap>(r));
 
 export interface TraceSpan {
   trace_id: string;

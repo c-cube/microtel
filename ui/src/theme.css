@@ -237,6 +237,17 @@ button, input, select { font-family: inherit; font-weight: inherit; }
   cursor: pointer;
 }
 .chip-x:hover { color: var(--danger); }
+button.chip-clear {
+  padding: 1px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px dashed var(--line);
+  border-radius: 2px;
+  cursor: pointer;
+}
+button.chip-clear:hover { color: var(--ink-2); border-color: var(--muted); }
 
 /* --- panels --- */
 
