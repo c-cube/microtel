@@ -81,6 +81,7 @@ impl Stored for MetricBatch {
     fn tally(&self, stats: &Stats, stored: bool) {
         if stored {
             stats.points_stored(self.points.len() as u64);
+            stats.histograms_stored(self.histograms.len() as u64);
         }
     }
 }

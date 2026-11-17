@@ -226,14 +226,15 @@ fn purge_drops_expired_rows_but_keeps_shared_tables() {
         .unwrap();
     assert!(point.is_some(), "fresh point kept");
 
-    // documented limitation: series and resource tables are never GC'd
-    assert_eq!(store.count("series").unwrap(), 2);
+    // series without rows left after the sweep are pruned; live series stay
+    assert_eq!(store.count("series").unwrap(), 1);
 
     // purging again is a no-op
     store
         .purge_before(common::date_of(now - keys::NS_PER_DAY))
         .unwrap();
     assert_eq!(store.count("spans_by_trace").unwrap(), 1);
+    assert_eq!(store.count("series").unwrap(), 1);
 }
 
 #[test]

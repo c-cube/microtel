@@ -127,6 +127,9 @@ depth.addCallback((obs) => {
 const errors = meterProviderB
 	.getMeter("emitter-b")
 	.createCounter("errors_total", { unit: "1" });
+const latency = meterProviderA
+	.getMeter("emitter-a")
+	.createHistogram("latency_ms", { unit: "ms" });
 
 const traceWork = Promise.all([
 	traces(tracerA, "a", aTraces, 4),
@@ -136,6 +139,7 @@ const traceWork = Promise.all([
 for (let i = 0; i < 5; i++) {
 	requests.add(1, { route: `/r-${i % 2}` });
 	errors.add(1);
+	latency.record(20 + i * 30);
 	await sleep(150);
 }
 

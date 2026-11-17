@@ -79,6 +79,8 @@ fn attr_hash(name: &str) -> [u8; 16] {
     hash16(&AttrSet {
         attributes: vec![kv("service.name", name)],
         kind: MetricKind::Unspecified as i32,
+        resource_hash: Vec::new(),
+        temporality: 0,
     })
 }
 
@@ -89,6 +91,8 @@ fn series_row(name: &str, svc: &str, kind: MetricKind, hash: [u8; 16]) -> Series
         value: AttrSet {
             attributes: vec![kv("service.name", svc)],
             kind: kind as i32,
+            resource_hash: Vec::new(),
+            temporality: 0,
         }
         .encode_to_vec(),
     }
@@ -398,6 +402,7 @@ fn points_gauge_averages_and_sum_takes_last_per_bucket() {
     let hs = attr_hash("svc-a");
     store
         .apply_metrics(&MetricBatch {
+            resources: Vec::new(),
             series: vec![
                 series_row("g1", "svc-a", MetricKind::Gauge, hg),
                 series_row("s1", "svc-a", MetricKind::Sum, hs),
@@ -454,6 +459,7 @@ fn points_gauge_averages_and_sum_takes_last_per_bucket() {
                     ),
                 },
             ],
+            histograms: Vec::new(),
         })
         .unwrap();
 
@@ -492,6 +498,7 @@ fn points_filter_by_service_and_sort_lines_by_label() {
         let h = attr_hash(svc);
         store
             .apply_metrics(&MetricBatch {
+                resources: Vec::new(),
                 series: vec![series_row(metric, svc, MetricKind::Gauge, h)],
                 points: vec![PointRow {
                     name: metric.into(),
@@ -503,6 +510,7 @@ fn points_filter_by_service_and_sort_lines_by_label() {
                         otel_metrics::number_data_point::Value::AsDouble(1.0),
                     ),
                 }],
+                histograms: Vec::new(),
             })
             .unwrap();
     }
@@ -538,8 +546,10 @@ fn series_lists_name_and_attrs() {
     let h = attr_hash("svc-a");
     store
         .apply_metrics(&MetricBatch {
+            resources: Vec::new(),
             series: vec![series_row("g1", "svc-a", MetricKind::Gauge, h)],
             points: Vec::new(),
+            histograms: Vec::new(),
         })
         .unwrap();
 

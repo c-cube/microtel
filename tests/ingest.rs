@@ -10,9 +10,10 @@ const A_TRACES: usize = 6;
 const B_TRACES: usize = 4;
 // node spans: root+children = 6*(4+1) + 4*(3+1) = 46; rust requests add 2 valid spans
 const EXPECTED_SPANS: usize = 48;
-const EXPECTED_RESOURCES: usize = 3;
+const EXPECTED_RESOURCES: usize = 4; // span + metric resources now share the CF
 const EXPECTED_SERIES_MIN: usize = 5;
 const EXPECTED_POINTS_MIN: usize = 7;
+const EXPECTED_HISTOGRAMS_MIN: usize = 1; // SDK latency_ms histogram
 
 #[test]
 fn ingest_roundtrip() {
@@ -120,6 +121,10 @@ fn ingest_roundtrip() {
     assert!(
         common::cf_count(&db, "points") >= EXPECTED_POINTS_MIN,
         "points rows"
+    );
+    assert!(
+        common::cf_count(&db, "histograms") >= EXPECTED_HISTOGRAMS_MIN,
+        "histogram rows"
     );
 
     // envelopes decode and reference real resource rows

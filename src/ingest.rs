@@ -14,11 +14,12 @@ use tokio::sync::mpsc;
 use crate::keys;
 use crate::pipeline::Pipeline;
 use crate::proto::{
-    AttrSet, Data, ExportMetricsServiceRequest, ExportTraceServiceRequest, MetricKind,
-    SpanEnvelope, hash16,
+    AggregationTemporality as TemporalityKind, AttrSet, Data, ExportMetricsServiceRequest,
+    ExportTraceServiceRequest, MetricIdentity, MetricKind, NumberDataPoint, SpanEnvelope,
+    Temporality, hash16,
 };
 use crate::stats::{Endpoint, Stats};
-use crate::store::{MetricBatch, PointRow, SeriesRow, SpanBatch, SpanRow, Store};
+use crate::store::{HistRow, MetricBatch, PointRow, SeriesRow, SpanBatch, SpanRow, Store};
 
 pub struct App {
     pub traces: Pipeline<SpanBatch>,
@@ -144,58 +145,106 @@ async fn metrics_inner(app: &App, headers: &HeaderMap, body: Bytes) -> Response 
         Err(_) => return bad_request("unparseable protobuf"),
     };
     let mut batch = MetricBatch {
+        resources: Vec::new(),
         series: Vec::new(),
         points: Vec::new(),
+        histograms: Vec::new(),
     };
+    let mut res_rows: HashMap<[u8; keys::HASH_LEN], Vec<u8>> = HashMap::new();
     let mut series_rows: HashMap<(String, [u8; keys::HASH_LEN]), SeriesRow> = HashMap::new();
     let mut seen = 0u64;
+    let mut hists_seen = 0u64;
     for rm in req.resource_metrics {
+        let resource = rm.resource.unwrap_or_default();
+        let rh = hash16(&resource);
+        res_rows
+            .entry(rh)
+            .or_insert_with(|| resource.encode_to_vec());
+        let resource = Some(resource);
         for sm in rm.scope_metrics {
             for m in sm.metrics {
                 let name = m.name.clone();
-                let (kind, dps) = match m.data {
-                    Some(Data::Gauge(g)) => (MetricKind::Gauge, g.data_points),
-                    Some(Data::Sum(s)) => (MetricKind::Sum, s.data_points),
+                match m.data {
+                    Some(Data::Gauge(g)) => {
+                        let mut sink = MetricSink {
+                            batch: &mut batch,
+                            series: &mut series_rows,
+                            resource: &resource,
+                            resource_hash: rh,
+                            kind: MetricKind::Gauge,
+                            temporality: Temporality::Unspecified,
+                        };
+                        for dp in g.data_points {
+                            seen += 1;
+                            sink.number(name.clone(), dp);
+                        }
+                    }
+                    Some(Data::Sum(s)) => {
+                        let mut sink = MetricSink {
+                            batch: &mut batch,
+                            series: &mut series_rows,
+                            resource: &resource,
+                            resource_hash: rh,
+                            kind: MetricKind::Sum,
+                            temporality: temporality_of(s.aggregation_temporality),
+                        };
+                        for dp in s.data_points {
+                            seen += 1;
+                            sink.number(name.clone(), dp);
+                        }
+                    }
+                    Some(Data::Histogram(h)) => {
+                        let mut sink = MetricSink {
+                            batch: &mut batch,
+                            series: &mut series_rows,
+                            resource: &resource,
+                            resource_hash: rh,
+                            kind: MetricKind::Histogram,
+                            temporality: temporality_of(h.aggregation_temporality),
+                        };
+                        for dp in h.data_points {
+                            hists_seen += 1;
+                            sink.hist(
+                                name.clone(),
+                                &dp.attributes,
+                                dp.time_unix_nano,
+                                dp.encode_to_vec(),
+                            );
+                        }
+                    }
+                    Some(Data::ExponentialHistogram(h)) => {
+                        let mut sink = MetricSink {
+                            batch: &mut batch,
+                            series: &mut series_rows,
+                            resource: &resource,
+                            resource_hash: rh,
+                            kind: MetricKind::ExponentialHistogram,
+                            temporality: temporality_of(h.aggregation_temporality),
+                        };
+                        for dp in h.data_points {
+                            hists_seen += 1;
+                            sink.hist(
+                                name.clone(),
+                                &dp.attributes,
+                                dp.time_unix_nano,
+                                dp.encode_to_vec(),
+                            );
+                        }
+                    }
                     _ => {
                         log::debug!("metric type not stored (name={name})");
                         continue;
                     }
-                };
-                seen += dps.len() as u64;
-                for dp in dps {
-                    let value = dp.encode_to_vec();
-                    // Hash the attrs only, so stored series keys survive schema extensions.
-                    let attr_hash = hash16(&AttrSet {
-                        attributes: dp.attributes.clone(),
-                        kind: MetricKind::Unspecified as i32,
-                    });
-                    let attr_set = AttrSet {
-                        attributes: dp.attributes,
-                        kind: kind as i32,
-                    };
-                    let ymd = keys::ymd(dp.time_unix_nano);
-                    series_rows
-                        .entry((name.clone(), attr_hash))
-                        .or_insert_with(|| SeriesRow {
-                            name: name.clone(),
-                            attr_hash,
-                            value: attr_set.encode_to_vec(),
-                        });
-                    batch.points.push(PointRow {
-                        name: name.clone(),
-                        attr_hash,
-                        ymd,
-                        time_ns: dp.time_unix_nano,
-                        value,
-                    });
                 }
             }
         }
     }
     batch.series = series_rows.into_values().collect();
+    batch.resources = res_rows.into_iter().collect();
     match app.metrics.send(batch) {
         Ok(()) => {
             app.stats.points_received(seen);
+            app.stats.histograms_received(hists_seen);
             ok_protobuf()
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -264,4 +313,101 @@ fn ok_protobuf() -> Response {
 
 fn bad_request(msg: &'static str) -> Response {
     (StatusCode::BAD_REQUEST, msg).into_response()
+}
+
+type ResourceMsg = opentelemetry_proto::tonic::resource::v1::Resource;
+type AttrKeyValues = Vec<opentelemetry_proto::tonic::common::v1::KeyValue>;
+
+/// Hash of one metric series: datapoint attrs plus the exporting resource.
+fn series_hash(attributes: &AttrKeyValues, resource: &Option<ResourceMsg>) -> [u8; keys::HASH_LEN] {
+    hash16(&MetricIdentity {
+        attributes: attributes.clone(),
+        resource: resource.clone(),
+    })
+}
+
+fn temporality_of(aggregation: i32) -> Temporality {
+    match TemporalityKind::try_from(aggregation) {
+        Ok(TemporalityKind::Delta) => Temporality::Delta,
+        Ok(TemporalityKind::Cumulative) => Temporality::Cumulative,
+        _ => Temporality::Unspecified,
+    }
+}
+
+fn push_series_row(
+    series_rows: &mut HashMap<(String, [u8; keys::HASH_LEN]), SeriesRow>,
+    name: &str,
+    attr_hash: [u8; keys::HASH_LEN],
+    attributes: &AttrKeyValues,
+    kind: MetricKind,
+    temporality: Temporality,
+    resource_hash: [u8; keys::HASH_LEN],
+) {
+    series_rows
+        .entry((name.to_string(), attr_hash))
+        .or_insert_with(|| SeriesRow {
+            name: name.to_string(),
+            attr_hash,
+            value: AttrSet {
+                attributes: attributes.clone(),
+                kind: kind as i32,
+                resource_hash: resource_hash.to_vec(),
+                temporality: temporality as i32,
+            }
+            .encode_to_vec(),
+        });
+}
+
+/// Per-metric accumulators sharing one resource-derived series identity.
+struct MetricSink<'a> {
+    batch: &'a mut MetricBatch,
+    series: &'a mut HashMap<(String, [u8; keys::HASH_LEN]), SeriesRow>,
+    resource: &'a Option<ResourceMsg>,
+    resource_hash: [u8; keys::HASH_LEN],
+    kind: MetricKind,
+    temporality: Temporality,
+}
+
+impl MetricSink<'_> {
+    fn number(&mut self, name: String, dp: NumberDataPoint) {
+        let attr_hash = series_hash(&dp.attributes, self.resource);
+        let ymd = keys::ymd(dp.time_unix_nano);
+        push_series_row(
+            self.series,
+            &name,
+            attr_hash,
+            &dp.attributes,
+            self.kind,
+            self.temporality,
+            self.resource_hash,
+        );
+        self.batch.points.push(PointRow {
+            name,
+            attr_hash,
+            ymd,
+            time_ns: dp.time_unix_nano,
+            value: dp.encode_to_vec(),
+        });
+    }
+
+    fn hist(&mut self, name: String, attributes: &AttrKeyValues, time_ns: u64, value: Vec<u8>) {
+        let attr_hash = series_hash(attributes, self.resource);
+        let ymd = keys::ymd(time_ns);
+        push_series_row(
+            self.series,
+            &name,
+            attr_hash,
+            attributes,
+            self.kind,
+            self.temporality,
+            self.resource_hash,
+        );
+        self.batch.histograms.push(HistRow {
+            name,
+            attr_hash,
+            ymd,
+            time_ns,
+            value,
+        });
+    }
 }

@@ -8,8 +8,10 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 
 pub use mcol::ExportMetricsServiceRequest;
-pub use metrics::NumberDataPoint;
 pub use metrics::metric::Data;
+pub use metrics::{
+    AggregationTemporality, ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint,
+};
 pub use tcol::ExportTraceServiceRequest;
 pub use trace::Span;
 
@@ -31,6 +33,15 @@ pub struct SpanEnvelope {
     pub span: Option<Span>,
 }
 
+/// Series identity: datapoint attrs plus the exporting resource.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct MetricIdentity {
+    #[prost(message, repeated, tag = "1")]
+    pub attributes: Vec<KeyValue>,
+    #[prost(message, optional, tag = "2")]
+    pub resource: Option<Resource>,
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct AttrSet {
     #[prost(message, repeated, tag = "1")]
@@ -38,6 +49,11 @@ pub struct AttrSet {
     /// Metric aggregation type, rides in the value so the attrs-only hash stays stable.
     #[prost(enumeration = "MetricKind", tag = "2")]
     pub kind: i32,
+    /// Hash of the exporting resource; resolves service.name at read time.
+    #[prost(bytes = "vec", tag = "3")]
+    pub resource_hash: Vec<u8>,
+    #[prost(enumeration = "Temporality", tag = "4")]
+    pub temporality: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -45,4 +61,14 @@ pub enum MetricKind {
     Unspecified = 0,
     Gauge = 1,
     Sum = 2,
+    Histogram = 3,
+    ExponentialHistogram = 4,
+}
+
+/// Mirrors the OTLP `AggregationTemporality` numbering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+pub enum Temporality {
+    Unspecified = 0,
+    Delta = 1,
+    Cumulative = 2,
 }

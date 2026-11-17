@@ -33,6 +33,8 @@ pub struct Stats {
     spans_dropped: AtomicU64,
     points_received: AtomicU64,
     points_stored: AtomicU64,
+    histograms_received: AtomicU64,
+    histograms_stored: AtomicU64,
     queue_depth: [Arc<AtomicU64>; 2],
 }
 
@@ -46,6 +48,8 @@ impl Stats {
             spans_dropped: AtomicU64::new(0),
             points_received: AtomicU64::new(0),
             points_stored: AtomicU64::new(0),
+            histograms_received: AtomicU64::new(0),
+            histograms_stored: AtomicU64::new(0),
             queue_depth: [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))],
         }
     }
@@ -80,6 +84,14 @@ impl Stats {
 
     pub fn points_stored(&self, n: u64) {
         self.points_stored.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn histograms_received(&self, n: u64) {
+        self.histograms_received.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn histograms_stored(&self, n: u64) {
+        self.histograms_stored.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn render(&self, store: &Store) -> String {
@@ -130,6 +142,18 @@ impl Stats {
             "points_stored_total",
             "Metric datapoints persisted to RocksDB.",
             val(&self.points_stored),
+        );
+        counter(
+            &mut out,
+            "histograms_received_total",
+            "Histogram datapoints accepted into the ingest queue.",
+            val(&self.histograms_received),
+        );
+        counter(
+            &mut out,
+            "histograms_stored_total",
+            "Histogram datapoints persisted to RocksDB.",
+            val(&self.histograms_stored),
         );
 
         for (label, i) in SIGNALS {

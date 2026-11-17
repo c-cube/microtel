@@ -21,8 +21,11 @@ const CF_SCOPES: &str = "scopes";
 pub const CF_SERIES: &str = "series";
 /// `points` key: `series prefix | date | time_ns` -> raw `NumberDataPoint` proto.
 pub const CF_POINTS: &str = "points";
+/// `histograms` key: same layout as `points`; value is a raw `HistogramDataPoint`
+/// or `ExponentialHistogramDataPoint` proto, disambiguated by the series kind.
+pub const CF_HISTOGRAMS: &str = "histograms";
 
-const ALL_CFS: [&str; 7] = [
+const ALL_CFS: [&str; 8] = [
     "default",
     CF_SPAN_TRACE,
     CF_SPAN_TIME,
@@ -30,6 +33,7 @@ const ALL_CFS: [&str; 7] = [
     CF_SCOPES,
     CF_SERIES,
     CF_POINTS,
+    CF_HISTOGRAMS,
 ];
 
 /// rocksdb 0.23 does not re-export a Result alias.
@@ -71,9 +75,23 @@ pub struct SeriesRow {
     pub value: Vec<u8>,
 }
 
+/// Row inserted into `histograms`; same key layout as [`PointRow`].
+pub struct HistRow {
+    pub name: String,
+    pub attr_hash: [u8; keys::HASH_LEN],
+    /// YYYYMMDD date prefix for purge.
+    pub ymd: u32,
+    pub time_ns: u64,
+    /// Encoded `HistogramDataPoint` or `ExponentialHistogramDataPoint`.
+    pub value: Vec<u8>,
+}
+
 pub struct MetricBatch {
+    /// Content-addressed `resources` rows: hash -> encoded `Resource`.
+    pub resources: Vec<([u8; keys::HASH_LEN], Vec<u8>)>,
     pub series: Vec<SeriesRow>,
     pub points: Vec<PointRow>,
+    pub histograms: Vec<HistRow>,
 }
 
 /// Union of packed span-id lists, the `spans_by_time` merge operator.
@@ -147,6 +165,7 @@ impl Store {
             CF_SCOPES,
             CF_SERIES,
             CF_POINTS,
+            CF_HISTOGRAMS,
         ]
         .iter()
         .filter_map(|cf| {
@@ -221,9 +240,17 @@ impl Store {
     }
 
     pub fn apply_metrics(&self, batch: &MetricBatch) -> DbResult<()> {
+        let cf_res = self.cf(CF_RESOURCES);
         let cf_series = self.cf(CF_SERIES);
         let cf_points = self.cf(CF_POINTS);
+        let cf_hists = self.cf(CF_HISTOGRAMS);
         let mut wb = WriteBatch::default();
+        // content-addressed shared rows: insert only when absent
+        for (hash, bytes) in &batch.resources {
+            if self.db.get_cf(cf_res, hash.as_slice())?.is_none() {
+                wb.put_cf(cf_res, hash.as_slice(), bytes.as_slice());
+            }
+        }
         for s in &batch.series {
             let key = keys::series_prefix(&s.name, &s.attr_hash);
             if self.db.get_cf(cf_series, key.as_slice())?.is_none() {
@@ -237,35 +264,71 @@ impl Store {
                 p.value.as_slice(),
             );
         }
+        for h in &batch.histograms {
+            wb.put_cf(
+                cf_hists,
+                keys::point_key(&h.name, &h.attr_hash, h.ymd, h.time_ns),
+                h.value.as_slice(),
+            );
+        }
         self.db.write(wb)
     }
 
-    /// Delete rows dated strictly before `cutoff`.
+    /// Delete rows dated strictly before `cutoff`; drop series left with no
+    /// rows in either `points` or `histograms`.
     pub fn purge_before(&self, cutoff: Date) -> DbResult<()> {
         let to = keys::ymd_of(cutoff).to_be_bytes();
         self.db
             .delete_range_cf(&self.cf(CF_SPAN_TRACE), &[] as &[u8], &to)?;
         self.db
             .delete_range_cf(&self.cf(CF_SPAN_TIME), &[] as &[u8], &to)?;
-        // points are nested under series prefixes; range-delete each below the cutoff date
+        // points and histograms are nested under series prefixes; range-delete
+        // each prefix below the cutoff date
         let mut seen = HashSet::new();
         let mut prefixes: Vec<Vec<u8>> = Vec::new();
-        let iter = self.db.iterator_cf(self.cf(CF_POINTS), IteratorMode::Start);
-        for kv in iter {
-            let (k, _) = kv?;
-            if let Some(end) = keys::series_prefix_len(&k)
-                && seen.insert(k[..end].to_vec())
-            {
-                prefixes.push(k[..end].to_vec());
+        for cf in [CF_POINTS, CF_HISTOGRAMS] {
+            let iter = self.db.iterator_cf(self.cf(cf), IteratorMode::Start);
+            for kv in iter {
+                let (k, _) = kv?;
+                if let Some(end) = keys::series_prefix_len(&k)
+                    && seen.insert(k[..end].to_vec())
+                {
+                    prefixes.push(k[..end].to_vec());
+                }
             }
         }
-        for pfx in prefixes {
+        for pfx in &prefixes {
             let mut from = pfx.clone();
             from.extend_from_slice(&[0u8; 4]);
             let mut to_p = pfx.clone();
             to_p.extend_from_slice(&to);
-            self.db.delete_range_cf(&self.cf(CF_POINTS), from, to_p)?;
+            self.db.delete_range_cf(&self.cf(CF_POINTS), &from, &to_p)?;
+            self.db
+                .delete_range_cf(&self.cf(CF_HISTOGRAMS), &from, &to_p)?;
         }
-        Ok(())
+        let cf_series = self.cf(CF_SERIES);
+        let cf_points = self.cf(CF_POINTS);
+        let cf_hists = self.cf(CF_HISTOGRAMS);
+        let mut wb = WriteBatch::default();
+        for pfx in &prefixes {
+            if self.prefix_empty(cf_points, pfx)? && self.prefix_empty(cf_hists, pfx)? {
+                wb.delete_cf(cf_series, pfx.as_slice());
+            }
+        }
+        self.db.write(wb)
+    }
+
+    /// True when no key with this prefix remains in the column family.
+    fn prefix_empty(&self, cf: &rocksdb::ColumnFamily, pfx: &[u8]) -> DbResult<bool> {
+        Ok(
+            match self
+                .db
+                .iterator_cf(cf, IteratorMode::From(pfx, Direction::Forward))
+                .next()
+            {
+                Some(Ok((key, _))) => !key.starts_with(pfx),
+                _ => true,
+            },
+        )
     }
 }

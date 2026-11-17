@@ -241,6 +241,7 @@ pub fn open_read_only(data_dir: &Path) -> DB {
         "scopes",
         "series",
         "points",
+        "histograms",
     ];
     let cfs: Vec<_> = names
         .iter()
@@ -296,11 +297,18 @@ pub fn series_row(name: &str, attr_hash: [u8; 16]) -> SeriesRow {
         value: microtel::proto::AttrSet {
             attributes: vec![kv("k", "v")],
             kind: 0,
+            resource_hash: Vec::new(),
+            temporality: 0,
         }
         .encode_to_vec(),
     }
 }
 
 pub fn metric_batch(series: Vec<SeriesRow>, points: Vec<PointRow>) -> MetricBatch {
-    MetricBatch { series, points }
+    MetricBatch {
+        resources: Vec::new(),
+        series,
+        points,
+        histograms: Vec::new(),
+    }
 }
